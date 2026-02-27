@@ -65,7 +65,6 @@ DEFAULT_OUTPUT = "informe_cambios.docx"
 
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
-# FIX BUG 1: Meses en espa~nol para evitar fecha en ingles
 MESES_ES = {
     1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
     5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
@@ -272,7 +271,6 @@ class FileChange:
             if not a_line:
                 continue
 
-            # FIX BUG 3: Solo aplicar eqeqeq si la linea REALMENTE contiene == o !=
             # (regex negativo lookahead/lookbehind para evitar === y !==)
             has_equality_op = bool(re.search(r'(?<![=!<>])={2}(?!=)|(?<!!)!={1}(?!=)', r_line))
             if has_equality_op:
@@ -487,14 +485,12 @@ def get_category(fc: FileChange) -> str:
 
 # =============================================================================
 # SENALES DE IMPACTO TECNICO
-# FIX BUG 4: Patrones AuthService mas precisos para evitar falsos positivos
 # =============================================================================
 IMPACT_SIGNALS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r'\.subscribe\s*\('),
      'Flujo asincrono RxJS'),
     (re.compile(r'catchError|throwError|try\s*{|except\s+|\.catch\s*\('),
      'Gestion de errores y excepciones'),
-    # FIX BUG 4: Solo disparar en servicios/clases reales de auth, no en nombres de ruta/modulo
     (re.compile(r'\bAuthService\b|\bAuthGuard\b|inject\s*\(.*Auth|new\s+Auth\w+'),
      'Seguridad: Servicio de autenticacion'),
     (re.compile(r'\bJWT\b|jsonwebtoken|\.sign\s*\(|\.verify\s*\(|bearerToken|refreshToken'),
@@ -534,7 +530,115 @@ IMPACT_SIGNALS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r'canActivate|canLoad|canMatch|menuGuard|authGuard'),
      'Guards de ruta (control de acceso)'),
 ]
+# =============================================================================
+# MOTOR DE ANALISIS SEMANTICO CONTEXTUAL
+# =============================================================================
 
+class SemanticInsightEngine:
+    """
+    Motor heurístico que intenta deducir la intención del cambio.
+    No depende de ejemplos específicos.
+    Detecta patrones arquitectónicos, de layout, estado y diseño.
+    """
+
+    def analyze(self, fc: FileChange) -> List[str]:
+        insights = []
+
+        added = "\n".join(fc.added)
+        removed = "\n".join(fc.removed)
+        full = added + "\n" + removed
+
+        # ---------------------------------------------------------
+        # 1. Migración de lógica TS hacia CSS
+        # ---------------------------------------------------------
+        if fc.ext in ('.component.ts', '.ts'):
+            if re.search(r'\b(height|width)\s*:', removed) and \
+               re.search(r'calc\(.*vh', added):
+                insights.append(
+                    "Se migra control de dimensiones desde lógica TypeScript "
+                    "hacia cálculo dinámico en CSS, favoreciendo separación de responsabilidades."
+                )
+
+        # ---------------------------------------------------------
+        # 2. Simplificación de binding Angular
+        # ---------------------------------------------------------
+        if fc.ext in ('.html', '.component.html'):
+            if re.search(r'\[.*\]=', removed) and not re.search(r'\[.*\]=', added):
+                insights.append(
+                    "Se reduce uso de binding dinámico, simplificando el template "
+                    "y disminuyendo dependencia del estado del componente."
+                )
+
+        # ---------------------------------------------------------
+        # 3. Eliminación de propiedad posiblemente obsoleta
+        # ---------------------------------------------------------
+        if fc.ext in ('.ts', '.component.ts'):
+            if re.search(r'\b(public|private|protected)?\s*\w+\s*:', removed):
+                insights.append(
+                    "Se elimina propiedad del componente, posible reducción "
+                    "de estado interno o eliminación de lógica innecesaria."
+                )
+
+        # ---------------------------------------------------------
+        # 4. Consolidación de estilos
+        # ---------------------------------------------------------
+        if fc.ext in ('.scss', '.css', '.component.scss'):
+            if removed.count('}') > added.count('}'):
+                insights.append(
+                    "Se reduce cantidad de bloques CSS, indicando consolidación "
+                    "o simplificación de reglas de estilo."
+                )
+
+        # ---------------------------------------------------------
+        # 5. Eliminación de duplicidad estructural
+        # ---------------------------------------------------------
+        if len(set(fc.removed)) < len(fc.removed):
+            insights.append(
+                "Se eliminan líneas repetidas, posible corrección de duplicidad estructural."
+            )
+
+        # ---------------------------------------------------------
+        # 6. Refactor hacia patrón más declarativo
+        # ---------------------------------------------------------
+        if re.search(r'if\s*\(', removed) and not re.search(r'if\s*\(', added):
+            insights.append(
+                "Se reduce lógica condicional explícita, posible migración "
+                "hacia patrón más declarativo o basado en configuración."
+            )
+
+        # ---------------------------------------------------------
+        # 7. Mejora responsive
+        # ---------------------------------------------------------
+        if re.search(r'vh|vw|%', added) and not re.search(r'vh|vw|%', removed):
+            insights.append(
+                "Se introducen unidades relativas (vh/vw/%), indicando mejora en comportamiento responsive."
+            )
+
+        # ---------------------------------------------------------
+        # 8. Reducción de acoplamiento
+        # ---------------------------------------------------------
+        if re.search(r'import ', removed) and not re.search(r'import ', added):
+            insights.append(
+                "Se eliminan dependencias importadas, posible reducción de acoplamiento."
+            )
+
+        # ---------------------------------------------------------
+        # 9. Optimización de performance
+        # ---------------------------------------------------------
+        if re.search(r'\.subscribe\(', removed) and re.search(r'async|await|pipe', added):
+            insights.append(
+                "Se modifica patrón asincrónico, posible mejora en manejo de suscripciones o performance."
+            )
+
+        # ---------------------------------------------------------
+        # 10. Eliminación de estado redundante
+        # ---------------------------------------------------------
+        if re.search(r'\bthis\.', removed) and not re.search(r'\bthis\.', added):
+            insights.append(
+                "Se reduce uso de propiedades del componente, indicando simplificación del estado."
+            )
+
+        return insights
 def analyze_technical_impact(fc: FileChange) -> str:
     """
     FIX BUG 5: Archivos de entorno analizan full_content para detectar
@@ -547,7 +651,6 @@ def analyze_technical_impact(fc: FileChange) -> str:
         d = len(fc.removed)
         return f"Actualizacion de dependencias: +{n} entradas nuevas, -{d} eliminadas"
 
-    # FIX BUG 5: Para entornos incluir full_content en el analisis
     if fc.is_environment_file:
         search_text = "\n".join(fc.added + fc.removed + fc.full_content[:40])
     else:
@@ -581,7 +684,6 @@ def calculate_deploy_impact(fc: FileChange) -> str:
     if fc.is_lockfile:
         return "Leve"
 
-    # FIX BUG 5: Para entornos incluir full_content
     if fc.is_environment_file:
         all_lines   = "\n".join(fc.added + fc.removed + fc.full_content[:60])
     else:
@@ -592,7 +694,6 @@ def calculate_deploy_impact(fc: FileChange) -> str:
     score = 0
 
     # --- CRITICO ---
-    # FIX BUG 4: AuthService/AuthGuard solo como clase/servicio real, no como ruta
     if re.search(r'\bAuthService\b|\bAuthGuard\b|jsonwebtoken|\.verify\s*\(.*token', all_lines):
         score += 60
     if re.search(r'(?<!\w)password(?!\w)|\bbcrypt\b|\bsalt\b', all_lines, re.I):
@@ -923,7 +1024,6 @@ class ReportGenerator:
         style.font.size = Pt(10)
 
     def _title(self):
-        # FIX BUG 1: Fecha en espanol con diccionario de meses
         p = self.doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_after = Pt(3)
@@ -1103,6 +1203,7 @@ class ReportGenerator:
                     _bullet(self.doc, line, "-", C_DEL_TEXT)
 
     def _detail(self):
+        semantic_engine = SemanticInsightEngine()
         _h1(self.doc, "2. Detalle de Cambios por Archivo")
 
         for i, fc in enumerate(self.changes):
@@ -1119,6 +1220,17 @@ class ReportGenerator:
                 _run(p_ctx, ", ".join(fc.contexts), color=C_BODY, size=9, italic=True)
 
             deploy_level = calculate_deploy_impact(fc)
+             # -----------------------------------------
+            # ANALISIS SEMANTICO CONTEXTUAL
+            # -----------------------------------------
+            semantic_insights = semantic_engine.analyze(fc)
+            if semantic_insights:
+                p_sem = self.doc.add_paragraph()
+                _run(p_sem, "Analisis Semantico Detectado:",
+                     bold=True, color=C_TITLE, size=9)
+
+                for insight in semantic_insights:
+                    _bullet(self.doc, insight, ">", C_MOD_TEXT)
             tc_dep, _    = impact_colors(deploy_level)
             p_stats = self.doc.add_paragraph()
             p_stats.paragraph_format.space_after = Pt(4)
@@ -1131,10 +1243,8 @@ class ReportGenerator:
                 _bullet(self.doc, "Archivo binario. No se puede mostrar contenido de texto.",
                         "-", C_MUTED)
             elif fc.is_lockfile:
-                # FIX BUG 2: Lock files tienen renderizado compacto propio
                 self._render_lockfile_detail(fc)
             elif fc.needs_structural_summary:
-                # FIX BUG 2: Umbral inteligente por tipo de archivo
                 self._render_structural_summary(fc)
             else:
                 self._render_line_detail(fc)
