@@ -101,6 +101,8 @@ class FileChange:
     filepath: str
     added:    List[str] = field(default_factory=list)
     removed:  List[str] = field(default_factory=list)
+    added_with_line: List[Tuple[Optional[int], str]] = field(default_factory=list)
+    removed_with_line: List[Tuple[Optional[int], str]] = field(default_factory=list)
     full_content: List[str] = field(default_factory=list)
     contexts: Set[str]  = field(default_factory=set)
     kind: str = "modified"
@@ -189,9 +191,17 @@ class FileChange:
         return C_MOD_TEXT, C_MOD_BG
 
     def extract_structure(self) -> Dict[str, List[str]]:
-        """Analiza logicamente el codigo para extraer imports, clases y funciones."""
+        """Analiza logicamente el contenido para extraer estructura por tipo de archivo."""
         structure: Dict[str, List[str]] = {
-            "imports": [], "entities": [], "decorators": [], "routes": []
+            "imports": [],
+            "entities": [],
+            "decorators": [],
+            "routes": [],
+            "ui_components": [],
+            "angular_bindings": [],
+            "forms": [],
+            "events": [],
+            "css_selectors": [],
         }
         all_lines = self.added + self.removed
 
@@ -205,20 +215,118 @@ class FileChange:
             r"(path\s*:\s*['\"]|route\s*\(|router\.(get|post|put|delete|patch)\s*\()", re.I
         )
 
+        # HTML / Angular template
+        ui_component_pattern = re.compile(r'<\s*(p-[\w-]+|app-[\w-]+)\b', re.I)
+        angular_binding_pattern = re.compile(
+            r'(\[\([^\)]*\)\]|\[[^\]]+\]|\([^\)]+\)|\*ng(?:If|For|Switch)|\bngModel\b|\bformControlName\b)'
+        )
+        event_pattern = re.compile(r'\((click|change|input|submit|keyup|keydown|blur|focus)\)\s*=')
+        form_pattern = re.compile(r'<\s*(input|select|textarea|form|button|p-dropdown|p-inputtext|p-button)\b', re.I)
+
+        # SCSS / CSS
+        css_selector_pattern = re.compile(r'^\s*([.#][\w-]+|:host|::ng-deep|[a-zA-Z][\w-]*(?:\s+[a-zA-Z][\w-]*)?)\s*[{,]')
+
         for line in all_lines:
+            line_stripped = line.strip()
+
             if import_pattern.search(line) and line not in structure["imports"]:
                 structure["imports"].append(
                     line.strip()[:90] + ('...' if len(line) > 90 else '')
                 )
-            elif decorator_pattern.match(line) and line.strip() not in structure["decorators"]:
-                structure["decorators"].append(line.strip()[:60])
-            elif route_pattern.search(line) and line.strip() not in structure["routes"]:
-                structure["routes"].append(line.strip()[:80])
+            elif decorator_pattern.match(line) and line_stripped not in structure["decorators"]:
+                structure["decorators"].append(line_stripped[:60])
+            elif route_pattern.search(line) and line_stripped not in structure["routes"]:
+                structure["routes"].append(line_stripped[:80])
             elif entity_pattern.search(line):
-                clean_entity = line.strip().split('{')[0].strip()
+                clean_entity = line_stripped.split('{')[0].strip()
                 if clean_entity not in structure["entities"]:
                     structure["entities"].append(clean_entity)
+
+            if self.ext in ('.html', '.component.html'):
+                comp_match = ui_component_pattern.search(line)
+                if comp_match:
+                    comp = comp_match.group(1).lower()
+                    if comp not in structure["ui_components"]:
+                        structure["ui_components"].append(comp)
+
+                bind_matches = angular_binding_pattern.findall(line)
+                for b in bind_matches:
+                    b_clean = b.strip()
+                    if b_clean and b_clean not in structure["angular_bindings"]:
+                        structure["angular_bindings"].append(b_clean)
+
+                ev_match = event_pattern.search(line)
+                if ev_match:
+                    ev = ev_match.group(1)
+                    if ev not in structure["events"]:
+                        structure["events"].append(ev)
+
+                form_match = form_pattern.search(line)
+                if form_match:
+                    frm = form_match.group(1).lower()
+                    if frm not in structure["forms"]:
+                        structure["forms"].append(frm)
+
+            if self.ext in ('.scss', '.css', '.component.scss'):
+                sel_match = css_selector_pattern.search(line)
+                if sel_match:
+                    sel = sel_match.group(1).strip()
+                    if sel and sel not in structure["css_selectors"]:
+                        structure["css_selectors"].append(sel[:80])
         return structure
+
+    def build_functional_summary(self) -> List[str]:
+        """Genera una síntesis ejecutiva del cambio por archivo (sin detalle línea a línea)."""
+        summary: List[str] = []
+        n_add = len(self.added)
+        n_del = len(self.removed)
+        struct = self.extract_structure()
+
+        if self.ext in ('.html', '.component.html'):
+            if self.kind == 'added':
+                summary.append("Se incorpora una nueva plantilla de interfaz para la funcionalidad del módulo.")
+            elif self.kind == 'modified':
+                summary.append("Se ajusta la estructura del template para mejorar interacción y visualización.")
+
+            if struct["ui_components"]:
+                comps = ", ".join(struct["ui_components"][:6])
+                summary.append(f"Se integran componentes de UI: {comps}.")
+            if struct["forms"]:
+                controls = ", ".join(struct["forms"][:6])
+                summary.append(f"Se agregan controles de captura/acción: {controls}.")
+            if struct["angular_bindings"]:
+                summary.append(
+                    f"Se detectan bindings/directivas Angular ({len(struct['angular_bindings'])} usos) "
+                    "para enlazar estado y eventos del componente."
+                )
+            if struct["events"]:
+                events = ", ".join(struct["events"][:6])
+                summary.append(f"Se registran eventos de interacción de usuario: {events}.")
+
+        elif self.ext in ('.scss', '.css', '.component.scss'):
+            if self.kind == 'added':
+                summary.append("Se incorpora hoja de estilos asociada al componente para estandarizar la presentación.")
+            if struct["css_selectors"]:
+                sels = ", ".join(struct["css_selectors"][:6])
+                summary.append(f"Se definen selectores/reglas relevantes: {sels}.")
+
+        elif self.ext in ('.ts', '.component.ts', '.service.ts'):
+            if struct["entities"]:
+                ents = ", ".join(struct["entities"][:5])
+                summary.append(f"Se incorporan/ajustan estructuras lógicas: {ents}.")
+            if struct["imports"]:
+                summary.append("Se actualizan dependencias para soportar la nueva lógica del archivo.")
+
+        if not summary:
+            if self.kind == 'added':
+                summary.append("Se agrega archivo nuevo con estructura inicial funcional.")
+            elif self.kind == 'deleted':
+                summary.append("Se elimina archivo y su responsabilidad asociada del módulo.")
+            else:
+                summary.append("Se aplican ajustes internos en la implementación del archivo.")
+
+        summary.append(f"Balance de cambio: +{n_add} líneas / -{n_del} líneas.")
+        return summary[:5]
 
     def _extract_deleted_identifiers(self, line: str) -> List[str]:
         line = line.strip()
@@ -382,7 +490,7 @@ class DiffParser:
     _DEL    = re.compile(r'^deleted file mode')
     _REN    = re.compile(r'^rename to (.+)$')
     _BIN    = re.compile(r'^Binary files.*differ$')
-    _HUNK   = re.compile(r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@\s*(.*)$')
+    _HUNK   = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@\s*(.*)$')
     _PLUS3  = re.compile(r'^\+\+\+')
     _MIN3   = re.compile(r'^---')
 
@@ -390,12 +498,16 @@ class DiffParser:
         text = clean(text)
         files: List[FileChange] = []
         cur: Optional[FileChange] = None
+        old_line_no: Optional[int] = None
+        new_line_no: Optional[int] = None
 
         for line in text.splitlines():
             m_file = self._FILE.match(line)
             if m_file:
                 cur = FileChange(filepath=m_file.group(2).strip())
                 files.append(cur)
+                old_line_no = None
+                new_line_no = None
                 continue
             if cur is None:
                 continue
@@ -409,7 +521,9 @@ class DiffParser:
                 cur.kind = 'renamed'
                 cur.filepath = self._REN.match(line).group(1).strip()
             elif m_hunk := self._HUNK.match(line):
-                hint = m_hunk.group(1).strip()
+                old_line_no = int(m_hunk.group(1))
+                new_line_no = int(m_hunk.group(3))
+                hint = m_hunk.group(5).strip()
                 if hint and len(hint) > 2:
                     cur.contexts.add(hint[:60])
             elif self._PLUS3.match(line) or self._MIN3.match(line):
@@ -418,15 +532,25 @@ class DiffParser:
                 s = line[1:].strip()
                 if s:
                     cur.added.append(s)
+                    cur.added_with_line.append((new_line_no, s))
                     cur.full_content.append(s)
+                if new_line_no is not None:
+                    new_line_no += 1
             elif line.startswith('-') and not line.startswith('---'):
                 s = line[1:].strip()
                 if s:
                     cur.removed.append(s)
+                    cur.removed_with_line.append((old_line_no, s))
+                if old_line_no is not None:
+                    old_line_no += 1
             elif line.startswith(' '):
                 s = line[1:].strip()
                 if s:
                     cur.full_content.append(s)
+                if old_line_no is not None:
+                    old_line_no += 1
+                if new_line_no is not None:
+                    new_line_no += 1
 
         return [f for f in files if f.filepath]
 
@@ -639,6 +763,133 @@ class SemanticInsightEngine:
             )
 
         return insights
+
+
+class ChangeRelationAnalyzer:
+    """Detecta relaciones funcionales entre archivos modificados del mismo diff."""
+
+    _ENV_ENTRY = re.compile(r"^\s*([a-zA-Z_]\w*)\s*:\s*['\"]([^'\"]+)['\"]\s*,?\s*$")
+
+    def __init__(self, changes: List[FileChange]):
+        self.changes = changes
+        self.by_path = {c.filepath: c for c in changes}
+
+    def _component_family(self, fc: FileChange) -> List[str]:
+        """Relaciona artefactos hermanos de un componente Angular."""
+        name = fc.filename
+        if '.component.' not in name:
+            return []
+
+        base = name.split('.component.')[0]
+        folder = str(Path(fc.filepath).parent).replace('\\', '/')
+        siblings: List[str] = []
+        for other in self.changes:
+            if other.filepath == fc.filepath:
+                continue
+            other_folder = str(Path(other.filepath).parent).replace('\\', '/')
+            other_name = Path(other.filepath).name
+            if other_folder == folder and other_name.startswith(base + '.component.'):
+                siblings.append(other_name)
+        return siblings
+
+    def _extract_env_entries(self, fc: FileChange) -> List[Tuple[str, str, Optional[int]]]:
+        entries: List[Tuple[str, str, Optional[int]]] = []
+        seen: Set[Tuple[str, str]] = set()
+        source = fc.added_with_line or [(None, l) for l in fc.added]
+        for line_no, line in source:
+            m = self._ENV_ENTRY.match(line.strip())
+            if not m:
+                continue
+            key = m.group(1)
+            val = m.group(2)
+            if key.lower() in ('production', 'qa', 'local', 'staging'):
+                continue
+            pair = (key, val)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            entries.append((key, val, line_no))
+        return entries
+
+    def _usage_files_for_env_key(self, key: str, value: str, current_path: str) -> Tuple[List[str], List[str]]:
+        non_env_users: List[str] = []
+        env_users: List[str] = []
+        key_ref = re.compile(rf'\benvironment\.{re.escape(key)}\b')
+        val_ref = re.compile(re.escape(value))
+
+        for other in self.changes:
+            if other.filepath == current_path:
+                continue
+            sample = "\n".join(other.added + other.removed + other.full_content[:200])
+            if key_ref.search(sample) or val_ref.search(sample):
+                if other.is_environment_file:
+                    env_users.append(other.filename)
+                else:
+                    non_env_users.append(other.filename)
+        return non_env_users[:6], env_users[:6]
+
+    def _endpoint_purpose(self, key: str, value: str) -> str:
+        text = f"{key} {value}".lower()
+        if re.search(r'mantenimiento|catalogo', text):
+            return "habilitar consumo de catálogos/mantenimientos"
+        if re.search(r'auth|login|token', text):
+            return "habilitar flujo de autenticación"
+        if re.search(r'perfil|user|usuario', text):
+            return "habilitar consulta/gestión de usuarios"
+        if re.search(r'param|config', text):
+            return "habilitar lectura de parámetros del sistema"
+        return "habilitar consumo de API del módulo"
+
+    def analyze(self, fc: FileChange) -> List[str]:
+        insights: List[str] = []
+
+        siblings = self._component_family(fc)
+        if siblings:
+            insights.append(
+                "Interrelación de componente: se modifican artefactos relacionados "
+                f"({', '.join(siblings)}), manteniendo coherencia entre lógica, vista y estilos."
+            )
+
+        if fc.is_environment_file:
+            env_entries = self._extract_env_entries(fc)
+            for key, value, _line_no in env_entries[:6]:
+                purpose = self._endpoint_purpose(key, value)
+                non_env_users, env_users = self._usage_files_for_env_key(key, value, fc.filepath)
+                msg = (
+                    f"Se agrega configuración de endpoint '{key}: {value}' para {purpose}."
+                )
+                if non_env_users:
+                    msg += f" Consumo detectado en archivos funcionales: {', '.join(non_env_users)}."
+                elif env_users:
+                    msg += f" Homologado en ambientes: {', '.join(env_users)}."
+                else:
+                    msg += " No se detecta consumo directo en otros archivos modificados de este diff."
+                insights.append(msg)
+
+        # Relación por importaciones directas entre archivos cambiados
+        import_lines = [l for l in fc.added if ' from ' in l and 'import ' in l]
+        related: List[str] = []
+        for line in import_lines:
+            m = re.search(r"from\s+['\"]([^'\"]+)['\"]", line)
+            if not m:
+                continue
+            path_hint = m.group(1).lower()
+            for other in self.changes:
+                if other.filepath == fc.filepath:
+                    continue
+                other_name = other.filename.lower().replace('.ts', '').replace('.html', '').replace('.scss', '')
+                if other_name and other_name in path_hint and other.filename not in related:
+                    related.append(other.filename)
+
+        if related:
+            insights.append(
+                "Dependencias cruzadas detectadas con archivos también modificados: "
+                f"{', '.join(related[:6])}."
+            )
+
+        return insights[:6]
+
+
 def analyze_technical_impact(fc: FileChange) -> str:
     """
     FIX BUG 5: Archivos de entorno analizan full_content para detectar
@@ -651,10 +902,10 @@ def analyze_technical_impact(fc: FileChange) -> str:
         d = len(fc.removed)
         return f"Actualizacion de dependencias: +{n} entradas nuevas, -{d} eliminadas"
 
-    if fc.is_environment_file:
-        search_text = "\n".join(fc.added + fc.removed + fc.full_content[:40])
-    else:
-        search_text = "\n".join(fc.added + fc.removed)
+    search_lines = fc.added + fc.removed
+    if not search_lines:
+        search_lines = fc.full_content[:40]
+    search_text = "\n".join(search_lines)
 
     found = []
     for pattern, description in IMPACT_SIGNALS:
@@ -684,10 +935,8 @@ def calculate_deploy_impact(fc: FileChange) -> str:
     if fc.is_lockfile:
         return "Leve"
 
-    if fc.is_environment_file:
-        all_lines   = "\n".join(fc.added + fc.removed + fc.full_content[:60])
-    else:
-        all_lines   = "\n".join(fc.added + fc.removed)
+    changed_lines = "\n".join(fc.added + fc.removed)
+    all_lines = changed_lines if changed_lines.strip() else "\n".join(fc.full_content[:60])
 
     n_add = len(fc.added)
     n_del = len(fc.removed)
@@ -704,6 +953,17 @@ def calculate_deploy_impact(fc: FileChange) -> str:
     # --- ALTO: entornos con URLs reales ---
     if fc.is_environment_file and re.search(r'apiLoginUrl|apiBackend|apiUrl\b', all_lines, re.I):
         score += 45
+
+    # --- BAJO/MEDIO: nuevos endpoints o rutas de recursos en env ---
+    if fc.is_environment_file:
+        env_added = "\n".join(fc.added)
+        env_entry_pattern = re.compile(r"\b[a-zA-Z_]\w*\s*:\s*['\"][^'\"]+['\"]")
+        endpoint_hint = re.compile(r'api|url|endpoint|catalogo|mantenimiento|parametro|service', re.I)
+        env_entries = env_entry_pattern.findall(env_added)
+        if env_entries:
+            score += 10
+            if any(endpoint_hint.search(e) for e in env_entries):
+                score += 8
 
     # --- ALTO: contratos publicos ---
     if re.search(r'\bexport\s+(interface|type|class|enum)\b', all_lines):
@@ -759,6 +1019,16 @@ def calculate_deploy_impact(fc: FileChange) -> str:
     if fc.removed and not fc.added:
         if all(fc.detect_linter_fix(l) for l in fc.removed if l.strip()):
             return "Nula"
+
+    # Cambios muy pequenos en environment no deben inflarse por contexto completo
+    critical_change = bool(re.search(
+        r'\bAuthService\b|\bAuthGuard\b|jsonwebtoken|\.verify\s*\(.*token|(?<!\w)password(?!\w)|\bbcrypt\b|\bsalt\b|migration|alembic|flyway|DROP TABLE|ALTER TABLE',
+        changed_lines,
+        re.I,
+    ))
+    total_lines = n_add + n_del
+    if fc.is_environment_file and total_lines <= 5 and not critical_change:
+        score = min(score, 28)
 
     if score == 0:        return "Nula"
     elif score <= 10:     return "Leve"
@@ -1123,6 +1393,12 @@ class ReportGenerator:
         """Renderizado de resumen estructural para archivos extensos o con interfaces."""
         p_lbl = self.doc.add_paragraph()
         _run(p_lbl, "Resumen Estructural del archivo:", bold=True, color=C_TITLE, size=9)
+
+        p_exec = self.doc.add_paragraph()
+        _run(p_exec, "Sintesis funcional del cambio:", bold=True, color=C_SUBTITLE, size=9)
+        for item in fc.build_functional_summary():
+            _bullet(self.doc, item, "-", C_BODY, indent=1.5)
+
         struct = fc.extract_structure()
 
         if struct["decorators"]:
@@ -1150,6 +1426,36 @@ class ReportGenerator:
             for rt in struct["routes"]:
                 _bullet(self.doc, rt, "-", C_MOD_TEXT, indent=1.5)
 
+        if struct["ui_components"]:
+            p_ui = self.doc.add_paragraph()
+            _run(p_ui, "Componentes de interfaz detectados:", bold=True, color=C_SUBTITLE, size=9)
+            for comp in struct["ui_components"][:12]:
+                _bullet(self.doc, comp, "-", C_MOD_TEXT, indent=1.5)
+
+        if struct["forms"]:
+            p_f = self.doc.add_paragraph()
+            _run(p_f, "Controles de formulario/accion:", bold=True, color=C_SUBTITLE, size=9)
+            for ctrl in struct["forms"][:12]:
+                _bullet(self.doc, ctrl, "-", C_BODY, indent=1.5)
+
+        if struct["angular_bindings"]:
+            p_b = self.doc.add_paragraph()
+            _run(p_b, "Bindings y directivas Angular:", bold=True, color=C_SUBTITLE, size=9)
+            for bind in struct["angular_bindings"][:12]:
+                _bullet(self.doc, bind, "-", C_BODY, indent=1.5)
+
+        if struct["events"]:
+            p_ev = self.doc.add_paragraph()
+            _run(p_ev, "Eventos de usuario detectados:", bold=True, color=C_SUBTITLE, size=9)
+            for ev in struct["events"][:12]:
+                _bullet(self.doc, ev, "-", C_REF_TEXT, indent=1.5)
+
+        if struct["css_selectors"]:
+            p_css = self.doc.add_paragraph()
+            _run(p_css, "Selectores/Reglas de estilo detectados:", bold=True, color=C_SUBTITLE, size=9)
+            for sel in struct["css_selectors"][:12]:
+                _bullet(self.doc, sel, "-", C_BODY, indent=1.5)
+
         if not any(struct.values()):
             _bullet(
                 self.doc,
@@ -1162,8 +1468,11 @@ class ReportGenerator:
         if fc.added:
             p_add = self.doc.add_paragraph()
             _run(p_add, "Lineas anadidas:", bold=True, color=C_ADD_TEXT, size=9)
-            for line in fc.added:
-                _bullet(self.doc, line, "+", C_ADD_TEXT)
+            for line_no, line in (fc.added_with_line or [(None, l) for l in fc.added]):
+                if line_no is not None:
+                    _bullet(self.doc, f"L{line_no}: {line}", "+", C_ADD_TEXT)
+                else:
+                    _bullet(self.doc, line, "+", C_ADD_TEXT)
 
         if fc.removed:
             p_rem = self.doc.add_paragraph()
@@ -1181,8 +1490,10 @@ class ReportGenerator:
                 "Test":          C_SUBTITLE,
             }
 
-            for line in fc.removed:
+            removed_items = fc.removed_with_line or [(None, l) for l in fc.removed]
+            for line_no, line in removed_items:
                 reason = fc.classify_removed_line(line)
+                line_display = f"L{line_no}: {line}" if line_no is not None else line
                 if reason:
                     tag_match = re.match(r'\[([^\]]+)\]\s*(.*)', reason)
                     if tag_match:
@@ -1194,16 +1505,17 @@ class ReportGenerator:
                         p_line.paragraph_format.first_line_indent = Cm(-0.5)
                         p_line.paragraph_format.space_after       = Pt(2)
                         _run(p_line, "-  ", bold=True, color=C_DEL_TEXT, size=9)
-                        _run(p_line, line, color=C_DEL_TEXT, size=9)
+                        _run(p_line, line_display, color=C_DEL_TEXT, size=9)
                         _run(p_line, f"  [{tag_key}: {tag_desc}]",
                              bold=True, color=tc_tag, size=8, italic=True)
                     else:
-                        _bullet(self.doc, f"{line}  ({reason})", "-", C_DEL_TEXT)
+                        _bullet(self.doc, f"{line_display}  ({reason})", "-", C_DEL_TEXT)
                 else:
-                    _bullet(self.doc, line, "-", C_DEL_TEXT)
+                    _bullet(self.doc, line_display, "-", C_DEL_TEXT)
 
     def _detail(self):
         semantic_engine = SemanticInsightEngine()
+        relation_engine = ChangeRelationAnalyzer(self.changes)
         _h1(self.doc, "2. Detalle de Cambios por Archivo")
 
         for i, fc in enumerate(self.changes):
@@ -1231,6 +1543,15 @@ class ReportGenerator:
 
                 for insight in semantic_insights:
                     _bullet(self.doc, insight, ">", C_MOD_TEXT)
+
+            relation_insights = relation_engine.analyze(fc)
+            if relation_insights:
+                p_rel = self.doc.add_paragraph()
+                _run(p_rel, "Interrelaciones Detectadas:",
+                     bold=True, color=C_TITLE, size=9)
+                for insight in relation_insights:
+                    _bullet(self.doc, insight, " > ", C_REF_TEXT)
+
             tc_dep, _    = impact_colors(deploy_level)
             p_stats = self.doc.add_paragraph()
             p_stats.paragraph_format.space_after = Pt(4)
@@ -1306,7 +1627,7 @@ class ReportGenerator:
             color=C_BODY, size=10
         )
         for rec in recs:
-            _bullet(self.doc, rec, "->", C_MOD_TEXT)
+            _bullet(self.doc, rec, " > ", C_MOD_TEXT)
         self.doc.add_paragraph()
 
     def _footer(self):
