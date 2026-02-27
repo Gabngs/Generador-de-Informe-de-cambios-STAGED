@@ -3,7 +3,7 @@
 git_diff_to_docx.py
 ────────────────────
 Lee 'informe.txt' (en la misma carpeta) generado con:
-    git --no-pager diff --staged > informe.txt
+    git --no-pager diff --staged -U9999 > informe.txt
 
 Genera un informe profesional .docx analizando la lógica
 de los cambios, resumiendo archivos nuevos y detectando impacto.
@@ -24,9 +24,9 @@ from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # PALETA DE COLORES
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 C_TITLE     = RGBColor(0x1E, 0x3A, 0x5F)
 C_SUBTITLE  = RGBColor(0x55, 0x55, 0x55)
 C_BODY      = RGBColor(0x22, 0x22, 0x22)
@@ -45,25 +45,65 @@ C_BORDER    = "CCCCCC"
 C_ROW_ALT   = "F8FAFC"
 C_WHITE     = "FFFFFF"
 
+# Colores para niveles de impacto
+C_IMPACT_NULA     = RGBColor(0x6B, 0x72, 0x80)
+C_IMPACT_LEVE     = RGBColor(0x05, 0x96, 0x69)
+C_IMPACT_BAJA     = RGBColor(0x0D, 0x94, 0x88)
+C_IMPACT_MEDIA    = RGBColor(0xD9, 0x77, 0x06)
+C_IMPACT_ALTA     = RGBColor(0xDC, 0x25, 0x26)
+C_IMPACT_CRITICA  = RGBColor(0x7F, 0x1D, 0x1D)
+
+BG_IMPACT_NULA    = "F3F4F6"
+BG_IMPACT_LEVE    = "ECFDF5"
+BG_IMPACT_BAJA    = "F0FDFA"
+BG_IMPACT_MEDIA   = "FFFBEB"
+BG_IMPACT_ALTA    = "FFF1F2"
+BG_IMPACT_CRITICA = "FEF2F2"
+
 DEFAULT_INPUT  = "informe.txt"
 DEFAULT_OUTPUT = "informe_cambios.docx"
 
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+# FIX BUG 1: Meses en espa~nol para evitar fecha en ingles
+MESES_ES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
+    5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
+    9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
+}
+
+def fecha_espanol() -> str:
+    hoy = datetime.now()
+    return f"{hoy.day} de {MESES_ES[hoy.month]} de {hoy.year}"
 
 def clean(text: str) -> str:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     text = ANSI_RE.sub('', text)
     return text.replace('\x00', '')
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# NIVELES DE IMPACTO
+# =============================================================================
+def impact_colors(level: str) -> Tuple[RGBColor, str]:
+    return {
+        "Nula":    (C_IMPACT_NULA,    BG_IMPACT_NULA),
+        "Leve":    (C_IMPACT_LEVE,    BG_IMPACT_LEVE),
+        "Baja":    (C_IMPACT_BAJA,    BG_IMPACT_BAJA),
+        "Media":   (C_IMPACT_MEDIA,   BG_IMPACT_MEDIA),
+        "Alta":    (C_IMPACT_ALTA,    BG_IMPACT_ALTA),
+        "Critica": (C_IMPACT_CRITICA, BG_IMPACT_CRITICA),
+    }.get(level, (C_BODY, C_WHITE))
+
+# =============================================================================
 # MODELO: FileChange
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 @dataclass
 class FileChange:
     filepath: str
     added:    List[str] = field(default_factory=list)
     removed:  List[str] = field(default_factory=list)
-    contexts: Set[str]  = field(default_factory=set) # Funciones o bloques modificados
+    full_content: List[str] = field(default_factory=list)
+    contexts: Set[str]  = field(default_factory=set)
     kind: str = "modified"
     is_binary: bool = False
 
@@ -76,52 +116,268 @@ class FileChange:
         name = self.filename.lower()
         for double in ('.component.ts', '.component.html', '.component.scss',
                        '.service.ts', '.spec.ts', '.module.ts', '.pipe.ts',
-                       '.directive.ts', '.guard.ts', '.interceptor.ts'):
+                       '.directive.ts', '.guard.ts', '.interceptor.ts',
+                       '.reducer.ts', '.action.ts', '.effect.ts', '.selector.ts',
+                       '.resolver.ts', '.model.ts', '.interface.ts', '.enum.ts',
+                       '.helper.ts', '.util.ts', '.config.ts', '.constant.ts'):
             if name.endswith(double):
                 return double
         return Path(self.filepath).suffix.lower()
 
     @property
+    def is_lockfile(self) -> bool:
+        """Detecta archivos de lock/dependencias que no aportan valor en detalle linea a linea."""
+        return self.filename.lower() in (
+            'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+            'composer.lock', 'gemfile.lock', 'poetry.lock', 'cargo.lock',
+            'packages.lock.json', 'shrinkwrap.json'
+        )
+
+    @property
+    def is_environment_file(self) -> bool:
+        """Detecta archivos de entorno/configuracion de ambiente."""
+        name = self.filename.lower()
+        return (name.startswith('environment') and name.endswith('.ts')) or \
+               name in ('.env', '.env.local', '.env.production', '.env.staging', '.env.qa')
+
+    @property
+    def needs_structural_summary(self) -> bool:
+        """
+        FIX BUG 2: Umbral inteligente por tipo de archivo.
+        Determina si el archivo debe mostrarse como resumen estructural
+        en vez de linea por linea.
+        """
+        total = len(self.added) + len(self.removed)
+
+        # Lock files: siempre resumen (nunca linea a linea)
+        if self.is_lockfile:
+            return True
+
+        # Archivos grandes (mas de 60 lineas totales)
+        if total > 60:
+            return True
+
+        # Archivos nuevos con mas de 15 lineas: resumen estructural
+        if self.kind == 'added' and len(self.added) > 15:
+            return True
+
+        # Archivos con interfaces/tipos exportados (aunque sean pequenos)
+        all_text = "\n".join(self.added)
+        if re.search(r'export\s+(interface|type|enum|class)\b', all_text) and len(self.added) > 10:
+            return True
+
+        return False
+
+    @property
     def kind_label(self) -> str:
-        if self.kind == 'added': return 'Adición'
-        if self.kind == 'deleted': return 'Eliminación'
+        if self.kind == 'added':   return 'Adicion'
+        if self.kind == 'deleted': return 'Eliminacion'
         if self.kind == 'renamed': return 'Renombrado'
-        if self.is_binary: return 'Binario/Media'
+        if self.is_binary:         return 'Binario/Media'
         n_add, n_del = len(self.added), len(self.removed)
-        if n_del == 0 and n_add > 0: return 'Adición'
-        if n_add == 0 and n_del > 0: return 'Eliminación'
+        if n_del == 0 and n_add > 0: return 'Adicion'
+        if n_add == 0 and n_del > 0: return 'Eliminacion'
         if n_del > n_add * 2 and n_del > 10: return 'Refactor'
-        if n_add == 0 and n_del == 0: return 'Configuración'
-        return 'Modificación'
+        if n_add == 0 and n_del == 0: return 'Configuracion'
+        return 'Modificacion'
 
     @property
     def kind_colors(self) -> Tuple[RGBColor, str]:
         lbl = self.kind_label
-        if lbl == 'Adición':     return C_ADD_TEXT, C_ADD_BG
-        if lbl == 'Eliminación': return C_DEL_TEXT, C_DEL_BG
+        if lbl == 'Adicion':     return C_ADD_TEXT, C_ADD_BG
+        if lbl == 'Eliminacion': return C_DEL_TEXT, C_DEL_BG
         if lbl == 'Refactor':    return C_REF_TEXT, C_REF_BG
         return C_MOD_TEXT, C_MOD_BG
 
     def extract_structure(self) -> Dict[str, List[str]]:
-        """Analiza lógicamente el código para extraer imports, clases y funciones."""
-        structure = {"imports": [], "entities": []}
+        """Analiza logicamente el codigo para extraer imports, clases y funciones."""
+        structure: Dict[str, List[str]] = {
+            "imports": [], "entities": [], "decorators": [], "routes": []
+        }
         all_lines = self.added + self.removed
-        
-        import_pattern = re.compile(r'^\s*(import|from|require\(|include|using)\b')
-        entity_pattern = re.compile(r'^\s*(export )?(class|def|function|interface|const \w+\s*=\s*\(|let \w+\s*=\s*\()')
+
+        import_pattern    = re.compile(r'^\s*(import|from|require\(|include|using)\b')
+        entity_pattern    = re.compile(
+            r'^\s*(export )?(class|def|function|interface|const \w+\s*=\s*\(|'
+            r'let \w+\s*=\s*\(|async function|type\s+\w+\s*=|enum\s+\w+)'
+        )
+        decorator_pattern = re.compile(r'^\s*@\w+')
+        route_pattern     = re.compile(
+            r"(path\s*:\s*['\"]|route\s*\(|router\.(get|post|put|delete|patch)\s*\()", re.I
+        )
 
         for line in all_lines:
             if import_pattern.search(line) and line not in structure["imports"]:
-                structure["imports"].append(line.strip()[:80] + ('...' if len(line)>80 else ''))
-            elif entity_pattern.search(line) and line not in structure["entities"]:
+                structure["imports"].append(
+                    line.strip()[:90] + ('...' if len(line) > 90 else '')
+                )
+            elif decorator_pattern.match(line) and line.strip() not in structure["decorators"]:
+                structure["decorators"].append(line.strip()[:60])
+            elif route_pattern.search(line) and line.strip() not in structure["routes"]:
+                structure["routes"].append(line.strip()[:80])
+            elif entity_pattern.search(line):
                 clean_entity = line.strip().split('{')[0].strip()
                 if clean_entity not in structure["entities"]:
                     structure["entities"].append(clean_entity)
         return structure
 
-# ─────────────────────────────────────────────────────────────────────────────
+    def _extract_deleted_identifiers(self, line: str) -> List[str]:
+        line = line.strip()
+        m_ts_braces = re.search(r'import\s+\{([^}]+)\}', line)
+        if m_ts_braces:
+            return [x.strip() for x in m_ts_braces.group(1).split(',')]
+        m_ts_simple = re.search(r'import\s+([a-zA-Z0-9_]+)\s+from', line)
+        if m_ts_simple:
+            return [m_ts_simple.group(1)]
+        m_py_from = re.search(r'from\s+\S+\s+import\s+(.+)', line)
+        if m_py_from:
+            return [x.strip() for x in m_py_from.group(1).split(',')]
+        m_var = re.search(
+            r'(?:(?:private|public|protected|readonly|const|let|var|static)\s+)+([a-zA-Z0-9_]+)',
+            line
+        )
+        if m_var:
+            return [m_var.group(1)]
+        m_simple_var = re.match(r'^([a-zA-Z0-9_]+)\s*[=:]', line)
+        if m_simple_var:
+            return [m_simple_var.group(1)]
+        return []
+
+    def verify_dead_code(self, deleted_line: str) -> bool:
+        if not self.full_content:
+            return False
+        identifiers = [i for i in self._extract_deleted_identifiers(deleted_line) if i]
+        if not identifiers:
+            return False
+        for ident in identifiers:
+            pattern = re.compile(rf'\b{re.escape(ident)}\b')
+            if not any(pattern.search(line) for line in self.full_content):
+                return True
+        return False
+
+    def detect_linter_fix(self, removed_line: str) -> str:
+        """
+        Detecta si la eliminacion de una linea fue por correccion de linter/formatter.
+        FIX BUG 3: Corregido falso positivo en regla eqeqeq cuando r_line == a_line
+                   y la linea no contiene operadores de comparacion.
+        """
+        if not self.added:
+            return ""
+        r_line = removed_line.strip()
+        if not r_line:
+            return ""
+
+        for a_line in self.added:
+            a_line = a_line.strip()
+            if not a_line:
+                continue
+
+            # FIX BUG 3: Solo aplicar eqeqeq si la linea REALMENTE contiene == o !=
+            # (regex negativo lookahead/lookbehind para evitar === y !==)
+            has_equality_op = bool(re.search(r'(?<![=!<>])={2}(?!=)|(?<!!)!={1}(?!=)', r_line))
+            if has_equality_op:
+                r_eq = r_line.replace('!==', '\x00').replace('===', '\x01')
+                r_eq = r_eq.replace('!=', '!==').replace('==', '===')
+                r_eq = r_eq.replace('\x00', '!==').replace('\x01', '===')
+                # Solo reportar si realmente cambio algo
+                if r_eq == a_line and r_eq != r_line:
+                    return "ESLint: Igualdad estricta (=== / !==)"
+
+            # 2. ESLint prefer-const / no-var
+            if 'let' in r_line and re.sub(r'\blet\b', 'const', r_line) == a_line:
+                return "ESLint: Usar const en lugar de let"
+            if 'var' in r_line and re.sub(r'\bvar\b', 'let', r_line) == a_line:
+                return "ESLint: Usar let en lugar de var"
+            if 'var' in r_line and re.sub(r'\bvar\b', 'const', r_line) == a_line:
+                return "ESLint: Usar const en lugar de var"
+
+            # 3. Prettier quotes
+            if "'" in r_line and r_line.replace("'", '"') == a_line:
+                return "Prettier: Cambio a comillas dobles"
+            if '"' in r_line and r_line.replace('"', "'") == a_line:
+                return "Prettier: Cambio a comillas simples"
+
+            # 4. Prettier semi
+            if r_line + ';' == a_line:
+                return "Prettier: Agregar punto y coma"
+            if r_line == a_line + ';':
+                return "Prettier: Eliminar punto y coma"
+
+            # 5. Prettier: espaciado / indentacion (solo si las lineas son distintas)
+            r_ns = re.sub(r'\s+', '', r_line)
+            a_ns = re.sub(r'\s+', '', a_line)
+            if r_ns == a_ns and r_line != a_line and len(r_ns) > 2:
+                return "Prettier: Arreglo de espaciado/indentacion"
+
+            # 6. ESLint trailing comma
+            if (r_line.rstrip(',') == a_line.rstrip(',') and r_line != a_line
+                    and r_line.endswith(',') != a_line.endswith(',') and len(r_line) > 2):
+                return "ESLint: Trailing comma"
+
+            # 7. TSLint: tipo any -> unknown
+            if 'any' in r_line and re.sub(r'\bany\b', 'unknown', r_line) == a_line:
+                return "TSLint: Reemplazar 'any' por 'unknown'"
+
+            # 8. ESLint no-console
+            if re.match(r'^console\.(log|warn|error|info|debug)\s*\(', r_line):
+                return "ESLint: Eliminar console.log/warn/error"
+
+            # 9. Prettier: template literals
+            if '`' in r_line and r_line.replace('`', '"') == a_line:
+                return "Prettier: Template literal a comillas dobles"
+            if '"' in r_line and r_line.replace('"', '`') == a_line:
+                return "Prettier: Comillas a template literal"
+
+            # 10. ESLint prefer-arrow-callback
+            m_func  = re.match(r'function\s*\(([^)]*)\)\s*\{(.+)\}', r_line)
+            m_arrow = re.match(r'\(([^)]*)\)\s*=>\s*\{?(.+)\}?', a_line)
+            if m_func and m_arrow and m_func.group(1).strip() == m_arrow.group(1).strip():
+                return "ESLint: Convertir a arrow function"
+
+            # 11. TSLint: eliminar modificador 'public' implicito
+            if 'public' in r_line and re.sub(r'\bpublic\b\s*', '', r_line).strip() == a_line.strip():
+                return "TSLint: Eliminar modificador 'public' implicito"
+
+            # 12. ESLint: object shorthand { x: x } -> { x }
+            m_long  = re.search(r'\{\s*(\w+)\s*:\s*\1\s*\}', r_line)
+            m_short = re.search(r'\{\s*(\w+)\s*\}', a_line)
+            if m_long and m_short and m_long.group(1) == m_short.group(1):
+                return "ESLint: Object shorthand"
+
+            # 13. Prettier: parentesis innecesarios en arrow de un parametro
+            if '=>' in r_line and re.sub(r'\((\w+)\)\s*=>', r'\1 =>', r_line) == a_line:
+                return "Prettier: Eliminar parentesis en arrow function de un parametro"
+
+        return ""
+
+    def classify_removed_line(self, line: str) -> str:
+        """Clasifica la razon de eliminacion con mayor precision."""
+        linter = self.detect_linter_fix(line)
+        if linter:
+            return f"[Linter] {linter}"
+        if self.verify_dead_code(line):
+            return "[Limpieza] Codigo sin uso detectado"
+
+        stripped = line.strip()
+        if stripped.startswith('//') or stripped.startswith('#') \
+                or stripped.startswith('*') or stripped.startswith('/*'):
+            return "[Doc] Comentario o documentacion eliminada"
+        if re.match(r'(console\.(log|warn|error|debug|info)|print\(|logger\.|Log\.)', stripped):
+            return "[Debug] Traza o log de depuracion eliminada"
+        if re.search(r'\b(TODO|FIXME|HACK|XXX|TEMP)\b', stripped, re.I):
+            return "[Deuda tecnica] Comentario TODO/FIXME eliminado"
+        if re.search(r'\b(isDevMode|environment\.|process\.env|DEBUG|FEATURE_FLAG)\b', stripped, re.I):
+            return "[Config] Flag de entorno o feature flag"
+        if stripped.startswith('//') and re.search(r'[({;=]', stripped):
+            return "[Refactor] Codigo comentado eliminado"
+        if re.search(r'\b(mock|stub|fake|dummy|hardcoded|temp|test_data)\b', stripped, re.I):
+            return "[Test] Dato de prueba o mock eliminado"
+        return ""
+
+
+# =============================================================================
 # PARSER DE DIFF
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 class DiffParser:
     _FILE   = re.compile(r'^diff --git a/(.+?) b/(.+)$')
     _NEW    = re.compile(r'^new file mode')
@@ -143,9 +399,8 @@ class DiffParser:
                 cur = FileChange(filepath=m_file.group(2).strip())
                 files.append(cur)
                 continue
-
-            if cur is None: continue
-
+            if cur is None:
+                continue
             if self._NEW.match(line):
                 cur.kind = 'added'
             elif self._DEL.match(line):
@@ -156,92 +411,379 @@ class DiffParser:
                 cur.kind = 'renamed'
                 cur.filepath = self._REN.match(line).group(1).strip()
             elif m_hunk := self._HUNK.match(line):
-                context_hint = m_hunk.group(1).strip()
-                if context_hint and len(context_hint) > 2:
-                    cur.contexts.add(context_hint[:60]) # Guardar nombre de función/bloque afectado
+                hint = m_hunk.group(1).strip()
+                if hint and len(hint) > 2:
+                    cur.contexts.add(hint[:60])
             elif self._PLUS3.match(line) or self._MIN3.match(line):
                 continue
             elif line.startswith('+') and not line.startswith('+++'):
                 s = line[1:].strip()
-                if s: cur.added.append(s)
+                if s:
+                    cur.added.append(s)
+                    cur.full_content.append(s)
             elif line.startswith('-') and not line.startswith('---'):
                 s = line[1:].strip()
-                if s: cur.removed.append(s)
+                if s:
+                    cur.removed.append(s)
+            elif line.startswith(' '):
+                s = line[1:].strip()
+                if s:
+                    cur.full_content.append(s)
 
         return [f for f in files if f.filepath]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ANALIZADOR GENÉRICO 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# =============================================================================
+# CATEGORIAS DE ARCHIVOS
+# =============================================================================
 FILE_CATEGORIES: Dict[str, str] = {
-    '.component.html': 'Template Angular', '.component.ts': 'Componente Angular',
-    '.service.ts': 'Servicio Angular', '.spec.ts': 'Test Unitario',
-    '.html': 'Template', '.scss': 'Estilos', '.css': 'Estilos',
-    '.ts': 'TypeScript', '.js': 'JavaScript', '.py': 'Python',
-    '.json': 'Configuración', '.md': 'Documentación', '.sql': 'Base de Datos',
+    '.component.html':  'Template Angular',
+    '.component.ts':    'Componente Angular',
+    '.component.scss':  'Estilos Componente',
+    '.service.ts':      'Servicio Angular',
+    '.spec.ts':         'Test Unitario',
+    '.module.ts':       'Modulo Angular',
+    '.pipe.ts':         'Pipe Angular',
+    '.directive.ts':    'Directiva Angular',
+    '.guard.ts':        'Guard de Ruta',
+    '.interceptor.ts':  'Interceptor HTTP',
+    '.reducer.ts':      'Reducer NgRx',
+    '.action.ts':       'Accion NgRx',
+    '.effect.ts':       'Efecto NgRx',
+    '.selector.ts':     'Selector NgRx',
+    '.resolver.ts':     'Resolver Angular',
+    '.model.ts':        'Modelo de Datos',
+    '.interface.ts':    'Interfaz TypeScript',
+    '.enum.ts':         'Enumeracion',
+    '.helper.ts':       'Helper/Utilidad',
+    '.util.ts':         'Utilidad',
+    '.config.ts':       'Configuracion',
+    '.constant.ts':     'Constantes',
+    '.html':            'Template HTML',
+    '.scss':            'Estilos SCSS',
+    '.css':             'Estilos CSS',
+    '.ts':              'TypeScript',
+    '.js':              'JavaScript',
+    '.py':              'Python',
+    '.json':            'Configuracion JSON',
+    '.md':              'Documentacion',
+    '.sql':             'Base de Datos',
+    '.yml':             'Config YAML',
+    '.yaml':            'Config YAML',
+    '.env':             'Variables de Entorno',
+    '.sh':              'Script Shell',
+    '.xml':             'XML / Config',
+    '.graphql':         'Esquema GraphQL',
+    '.prisma':          'Schema Prisma ORM',
 }
 
+def get_category(fc: FileChange) -> str:
+    if fc.is_lockfile:
+        return 'Dependencias (Lock)'
+    if fc.is_environment_file:
+        return 'Archivo de Entorno'
+    return FILE_CATEGORIES.get(fc.ext, Path(fc.filepath).suffix.upper() or 'Archivo')
+
+
+# =============================================================================
+# SENALES DE IMPACTO TECNICO
+# FIX BUG 4: Patrones AuthService mas precisos para evitar falsos positivos
+# =============================================================================
 IMPACT_SIGNALS: List[Tuple[re.Pattern, str]] = [
-    (re.compile(r'\.subscribe\s*\('), 'Manejo de flujos asíncronos (RxJS)'),
-    (re.compile(r'catchError|throwError|try\s*{|except\s+'), 'Gestión y control de excepciones'),
-    (re.compile(r'apiUrl|API_URL|baseUrl|environ|\.env'), 'Cambio en variables de entorno o endpoints'),
-    (re.compile(r'router\.navigate|HttpResponse|redirect'), 'Lógica de ruteo o navegación'),
-    (re.compile(r'AuthService|token|JWT|password|hash|bcrypt', re.I), 'Capa de Seguridad y Autenticación'),
-    (re.compile(r'console\.(log|warn|error)|print\('), 'Modificación de trazabilidad (Logs)'),
-    (re.compile(r'SELECT|INSERT|UPDATE|DELETE|JOIN|Query', re.I), 'Interacción con Base de Datos / Consultas'),
-    (re.compile(r'def |class |function '), 'Definición de nuevas estructuras de negocio'),
+    (re.compile(r'\.subscribe\s*\('),
+     'Flujo asincrono RxJS'),
+    (re.compile(r'catchError|throwError|try\s*{|except\s+|\.catch\s*\('),
+     'Gestion de errores y excepciones'),
+    # FIX BUG 4: Solo disparar en servicios/clases reales de auth, no en nombres de ruta/modulo
+    (re.compile(r'\bAuthService\b|\bAuthGuard\b|inject\s*\(.*Auth|new\s+Auth\w+'),
+     'Seguridad: Servicio de autenticacion'),
+    (re.compile(r'\bJWT\b|jsonwebtoken|\.sign\s*\(|\.verify\s*\(|bearerToken|refreshToken'),
+     'Seguridad: Manejo de JWT/tokens'),
+    (re.compile(r'(?<!\w)password(?!\w)|\bhash\b|\bbcrypt\b|\bsalt\b|\bcipher\b', re.I),
+     'Seguridad: Credenciales o hashes'),
+    (re.compile(r'apiLoginUrl|apiBackend|apiUrl\b|API_URL|baseUrl|apiSIAW|apiSIP', re.I),
+     'Variable de entorno o endpoint de API'),
+    (re.compile(r'router\.navigate|HttpResponse|location\.href|\[routerLink\]'),
+     'Logica de ruteo o navegacion'),
+    (re.compile(r'HttpClient|http\.(get|post|put|delete|patch)\s*[(<]', re.I),
+     'Llamada HTTP a API externa'),
+    (re.compile(r'console\.(log|warn|error)|print\(|logger\.'),
+     'Trazabilidad (logs de depuracion)'),
+    (re.compile(r'SELECT\b|INSERT\b|UPDATE\b|DELETE\b|JOIN\b|\.save\s*\(|\.find\s*\(', re.I),
+     'Consulta u operacion de base de datos'),
+    (re.compile(r'\bexport\s+(class|interface|type|enum)\b'),
+     'Contrato exportado publicamente'),
+    (re.compile(r'@Input\s*\(\)|@Output\s*\(\)|EventEmitter|@Prop\s*\(\)'),
+     'Contrato de componente (inputs/outputs)'),
+    (re.compile(r'@NgModule\s*\(|providers\s*:\s*\[|declarations\s*:\s*\['),
+     'Configuracion de modulo Angular'),
+    (re.compile(r'environment\.(prod|production|cloud|staging|qa)', re.I),
+     'Configuracion de ambiente especifico'),
+    (re.compile(r'dispatch\s*\(|store\.select|createAction|createReducer|createEffect'),
+     'Estado global NgRx'),
+    (re.compile(r'migration|schema|alembic|flyway|liquibase|ALTER TABLE|DROP TABLE', re.I),
+     'Migracion de base de datos'),
+    (re.compile(r'cron|@Scheduled|scheduler|setInterval|setTimeout'),
+     'Tarea programada/scheduler'),
+    (re.compile(r'WebSocket|socket\.io|ws://|wss://'),
+     'Comunicacion en tiempo real (WebSocket)'),
+    (re.compile(r'\bcache\b|redis|memcache|localStorage|sessionStorage', re.I),
+     'Capa de cache o almacenamiento'),
+    (re.compile(r'\bi18n\b|translate\.|locale|l10n', re.I),
+     'Internacionalizacion (i18n)'),
+    (re.compile(r'canActivate|canLoad|canMatch|menuGuard|authGuard'),
+     'Guards de ruta (control de acceso)'),
 ]
 
-def analyze_impact(fc: FileChange) -> str:
-    if fc.is_binary: return "Actualización de archivo binario (ej. Imagen, PDF)."
-    
-    all_lines = "\n".join(fc.added + fc.removed)
-    found = set()
+def analyze_technical_impact(fc: FileChange) -> str:
+    """
+    FIX BUG 5: Archivos de entorno analizan full_content para detectar
+    patrones criticos que estan en lineas de contexto (sin + ni -).
+    """
+    if fc.is_binary:
+        return "Actualizacion de archivo binario (imagen, fuente, recurso)"
+    if fc.is_lockfile:
+        n = len(fc.added)
+        d = len(fc.removed)
+        return f"Actualizacion de dependencias: +{n} entradas nuevas, -{d} eliminadas"
 
+    # FIX BUG 5: Para entornos incluir full_content en el analisis
+    if fc.is_environment_file:
+        search_text = "\n".join(fc.added + fc.removed + fc.full_content[:40])
+    else:
+        search_text = "\n".join(fc.added + fc.removed)
+
+    found = []
     for pattern, description in IMPACT_SIGNALS:
-        if pattern.search(all_lines):
-            found.add(description)
+        if pattern.search(search_text):
+            found.append(description)
 
     if found:
-        return " | ".join(found)
+        return " | ".join(found[:4])
 
-    category = FILE_CATEGORIES.get(fc.ext, 'Archivo')
-    n_add, n_del = len(fc.added), len(fc.removed)
+    category = get_category(fc)
+    if len(fc.added) == 0 and len(fc.removed) == 0:
+        return f"Ajuste de propiedades o permisos en {category}"
+    if fc.kind == 'added':
+        return f"Implementacion inicial de {category}"
+    if fc.kind == 'deleted':
+        return f"Eliminacion completa de {category}"
+    return f"Modificacion de logica interna en {category}"
 
-    if n_add == 0 and n_del == 0: return f"Ajuste de propiedades/permisos en {category}"
-    if fc.kind == 'added': return f"Implementación base de {category}"
-    if fc.kind == 'deleted': return f"Depuración/Eliminación de {category}"
-    return f"Ajuste de lógica en {category}"
 
+def calculate_deploy_impact(fc: FileChange) -> str:
+    """
+    FIX BUG 4: Regex de AuthService mas preciso (sin falsos positivos en rutas).
+    FIX BUG 5: Archivos de entorno analizan full_content para score correcto.
+    """
+    if fc.is_binary:
+        return "Leve"
+    if fc.is_lockfile:
+        return "Leve"
+
+    # FIX BUG 5: Para entornos incluir full_content
+    if fc.is_environment_file:
+        all_lines   = "\n".join(fc.added + fc.removed + fc.full_content[:60])
+    else:
+        all_lines   = "\n".join(fc.added + fc.removed)
+
+    n_add = len(fc.added)
+    n_del = len(fc.removed)
+    score = 0
+
+    # --- CRITICO ---
+    # FIX BUG 4: AuthService/AuthGuard solo como clase/servicio real, no como ruta
+    if re.search(r'\bAuthService\b|\bAuthGuard\b|jsonwebtoken|\.verify\s*\(.*token', all_lines):
+        score += 60
+    if re.search(r'(?<!\w)password(?!\w)|\bbcrypt\b|\bsalt\b', all_lines, re.I):
+        score += 50
+    if re.search(r'migration|alembic|flyway|DROP TABLE|ALTER TABLE', all_lines, re.I):
+        score += 70
+
+    # --- ALTO: entornos con URLs reales ---
+    if fc.is_environment_file and re.search(r'apiLoginUrl|apiBackend|apiUrl\b', all_lines, re.I):
+        score += 45
+
+    # --- ALTO: contratos publicos ---
+    if re.search(r'\bexport\s+(interface|type|class|enum)\b', all_lines):
+        score += 40
+    if re.search(r'@Input\s*\(\)|@Output\s*\(\)|EventEmitter', all_lines):
+        score += 35
+    if re.search(r'@NgModule\s*\(|providers\s*:\s*\[|declarations\s*:\s*\[', all_lines):
+        score += 35
+    if re.search(r'dispatch\s*\(|createAction|createReducer|createEffect', all_lines):
+        score += 30
+
+    # --- MEDIO ---
+    if re.search(r'HttpClient|http\.(get|post|put|delete|patch)', all_lines, re.I):
+        score += 30
+    if re.search(r'catchError|throwError|try\s*{|except\s+', all_lines):
+        score += 20
+    if re.search(r'SELECT\b|INSERT\b|UPDATE\b|DELETE\b|\.save\s*\(', all_lines, re.I):
+        score += 25
+    if re.search(r'router\.navigate|canActivate|canLoad|authGuard|menuGuard', all_lines):
+        score += 20
+    if re.search(r'cron|scheduler|setTimeout|setInterval', all_lines):
+        score += 20
+    if re.search(r'WebSocket|socket\.io', all_lines, re.I):
+        score += 25
+
+    # --- BAJO: UI y estilos ---
+    if fc.ext in ('.scss', '.css', '.component.scss'):
+        score += 5
+    if fc.ext in ('.html', '.component.html'):
+        score += 10
+
+    # --- LEVE: tests, docs ---
+    if fc.ext == '.spec.ts':
+        score = min(score + 3, 15)
+    if fc.ext == '.md':
+        return "Nula"
+
+    # Bonus por magnitud
+    total_lines = n_add + n_del
+    if total_lines > 200:   score += 20
+    elif total_lines > 100: score += 12
+    elif total_lines > 50:  score += 6
+    elif total_lines > 20:  score += 3
+
+    # Archivo nuevo: cap de impacto
+    if fc.kind == 'added' and score < 40:
+        score = min(score, 30)
+    # Archivo eliminado: riesgo de dependencias rotas
+    if fc.kind == 'deleted':
+        score += 20
+
+    # Solo linter fixes
+    if fc.removed and not fc.added:
+        if all(fc.detect_linter_fix(l) for l in fc.removed if l.strip()):
+            return "Nula"
+
+    if score == 0:        return "Nula"
+    elif score <= 10:     return "Leve"
+    elif score <= 28:     return "Baja"
+    elif score <= 50:     return "Media"
+    elif score <= 75:     return "Alta"
+    else:                 return "Critica"
+
+
+# =============================================================================
+# RESUMEN DE LOCK FILE
+# =============================================================================
+def summarize_lockfile(fc: FileChange) -> Dict[str, List[str]]:
+    """Extrae nombres de paquetes nuevos/eliminados de un lock file."""
+    added_pkgs:   List[str] = []
+    removed_pkgs: List[str] = []
+    pkg_pattern = re.compile(r'"(@?[\w/@.-]+)":\s*\{|^(@?[\w/@.-]+)@[\d.^~]')
+
+    for line in fc.added:
+        m = pkg_pattern.search(line.strip())
+        if m:
+            name = (m.group(1) or m.group(2) or '').strip('"')
+            if name and name not in added_pkgs:
+                added_pkgs.append(name)
+
+    for line in fc.removed:
+        m = pkg_pattern.search(line.strip())
+        if m:
+            name = (m.group(1) or m.group(2) or '').strip('"')
+            if name and name not in removed_pkgs:
+                removed_pkgs.append(name)
+
+    return {"added": added_pkgs[:20], "removed": removed_pkgs[:20]}
+
+
+# =============================================================================
+# RECOMENDACIONES
+# =============================================================================
 def analyze_recommendations(changes: List[FileChange]) -> List[str]:
     recs = []
-    all_added   = "\n".join(l for f in changes for l in f.added).lower()
     all_removed = "\n".join(l for f in changes for l in f.removed).lower()
-    
+
     if 'console.' in all_removed or 'print(' in all_removed:
-        recs.append("Se limpiaron logs de depuración. Validar que no falten métricas críticas.")
-    if 'apiurl' in all_added or 'baseurl' in all_added or '.env' in all_added:
-        recs.append("Cambios en URLs o variables de entorno. Verificar despliegue en Staging/Producción.")
-    if any(f.is_binary for f in changes):
-        recs.append("Se modificaron archivos binarios. Verificar integridad de los assets visuales.")
+        recs.append(
+            "Se limpiaron logs de depuracion. Verificar que no falten "
+            "trazas criticas en produccion."
+        )
+
+    env_changes = [f for f in changes if f.is_environment_file]
+    if env_changes:
+        ambientes = [f.filename for f in env_changes]
+        recs.append(
+            f"Se modificaron {len(env_changes)} archivo(s) de entorno "
+            f"({', '.join(ambientes)}). Confirmar que los endpoints sean "
+            f"correctos en cada ambiente antes del despliegue."
+        )
+
+    if any(f.is_lockfile for f in changes):
+        recs.append(
+            "Se actualizo el archivo de dependencias. Ejecutar 'npm install' "
+            "en el servidor de CI/CD para sincronizar node_modules."
+        )
+
     if any(f.kind == 'deleted' for f in changes):
-        recs.append("Se eliminaron archivos. Ejecutar un build completo para asegurar que no hay dependencias rotas ('import' huérfanos).")
-    
-    has_ui = any(f.ext in ('.html', '.scss', '.css', '.vue', '.jsx', '.tsx') for f in changes)
-    if has_ui:
-        recs.append("Cambios detectados en la interfaz de usuario. Se sugiere QA visual en resoluciones móviles y de escritorio.")
+        recs.append(
+            "Se eliminaron archivos. Ejecutar build completo y verificar "
+            "que no queden imports huerfanos."
+        )
+
+    if any(f.ext in ('.html', '.scss', '.css', '.component.html', '.component.scss')
+           for f in changes):
+        recs.append(
+            "Cambios en interfaz de usuario. Realizar QA visual en "
+            "distintas resoluciones (movil y escritorio)."
+        )
+
+    all_code = "\n".join(l for f in changes for l in f.added + f.removed)
+    if re.search(r'\bexport\s+(interface|type)\b', all_code):
+        recs.append(
+            "Se modificaron interfaces o tipos exportados. Verificar que "
+            "todos los consumidores del tipo esten actualizados y que el "
+            "build compile sin errores de tipo."
+        )
+
+    if any(f.ext == '.spec.ts' for f in changes):
+        recs.append(
+            "Se modificaron tests unitarios. Ejecutar suite completa de "
+            "pruebas antes del merge."
+        )
+
+    if re.search(r'migration|ALTER TABLE|DROP', all_code, re.I):
+        recs.append(
+            "ALERTA: Detectadas posibles migraciones de base de datos. "
+            "Revisar con DBA antes del despliegue."
+        )
+
+    if re.search(r'@NgModule|providers\s*:|declarations\s*:', all_code):
+        recs.append(
+            "Se modifico un modulo Angular. Verificar que las declaraciones "
+            "y providers sean correctas y que no haya duplicados."
+        )
+
+    if any(calculate_deploy_impact(f) in ("Alta", "Critica") for f in changes):
+        recs.append(
+            "Existen cambios de impacto ALTO o CRITICO. Se recomienda "
+            "revision por pares (code review) antes del merge a develop."
+        )
 
     if not recs:
-        recs.append("Revisar cobertura de pruebas unitarias para las nuevas estructuras de negocio añadidas.")
-    return list(set(recs))
+        recs.append(
+            "No se detectaron riesgos criticos. Revisar cobertura de pruebas "
+            "unitarias para las nuevas estructuras anadidas."
+        )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS DOCX (Mantenidos igual para respetar tu diseño)
-# ─────────────────────────────────────────────────────────────────────────────
+    return list(dict.fromkeys(recs))
+
+
+# =============================================================================
+# HELPERS DOCX
+# =============================================================================
 def _set_bg(cell, hex_color: str):
     tcPr = cell._tc.get_or_add_tcPr()
     shd  = OxmlElement("w:shd")
-    shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto"); shd.set(qn("w:fill"), hex_color)
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color)
     tcPr.append(shd)
 
 def _set_borders(cell, color: str = "CCCCCC"):
@@ -249,20 +791,29 @@ def _set_borders(cell, color: str = "CCCCCC"):
     borders = OxmlElement("w:tcBorders")
     for side in ("top", "left", "bottom", "right"):
         el = OxmlElement(f"w:{side}")
-        el.set(qn("w:val"), "single"); el.set(qn("w:sz"), "4"); el.set(qn("w:space"), "0"); el.set(qn("w:color"), color)
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), "4")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), color)
         borders.append(el)
     tcPr.append(borders)
 
 def _set_width(cell, cm: float):
     tcPr = cell._tc.get_or_add_tcPr()
     tcW  = OxmlElement("w:tcW")
-    tcW.set(qn("w:w"), str(int(cm * 567))); tcW.set(qn("w:type"), "dxa")
+    tcW.set(qn("w:w"), str(int(cm * 567)))
+    tcW.set(qn("w:type"), "dxa")
     tcPr.append(tcW)
 
-def _run(para, text: str, bold=False, italic=False, color: RGBColor = None, size: float = 10, font: str = "Arial"):
+def _run(para, text: str, bold=False, italic=False,
+         color: RGBColor = None, size: float = 10, font: str = "Arial"):
     r = para.add_run(text)
-    r.bold, r.italic, r.font.size, r.font.name = bold, italic, Pt(size), font
-    if color: r.font.color.rgb = color
+    r.bold        = bold
+    r.italic      = italic
+    r.font.size   = Pt(size)
+    r.font.name   = font
+    if color:
+        r.font.color.rgb = color
     return r
 
 def _header_row(table, cols: List[Tuple[str, float]]):
@@ -270,193 +821,441 @@ def _header_row(table, cols: List[Tuple[str, float]]):
     for i, (text, w) in enumerate(cols):
         cell = row.cells[i]
         cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        _set_bg(cell, C_HDR_BG); _set_borders(cell, C_ACCENT); _set_width(cell, w)
-        p = cell.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        _run(p, text, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF))
+        _set_bg(cell, C_HDR_BG)
+        _set_borders(cell, C_ACCENT)
+        _set_width(cell, w)
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _run(p, text, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF), size=11)
 
 def _data_row(table, cells: List[Tuple[str, float, RGBColor, bool, str]]):
     row = table.add_row()
     for i, (text, w, tc, bold, bg) in enumerate(cells):
         cell = row.cells[i]
         cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        _set_bg(cell, bg); _set_borders(cell); _set_width(cell, w)
-        p = cell.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        _set_bg(cell, bg)
+        _set_borders(cell)
+        _set_width(cell, w)
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         for j, line in enumerate(text.split("\n")):
-            if j > 0: p = cell.add_paragraph()
-            _run(p, line, bold=bold, color=tc, size=9)
+            if j > 0:
+                p = cell.add_paragraph()
+            _run(p, line, bold=bold, color=tc, size=10)
 
 def _bullet(doc, text: str, symbol: str, color: RGBColor, indent: float = 1.0):
     p = doc.add_paragraph()
-    p.paragraph_format.left_indent, p.paragraph_format.first_line_indent, p.paragraph_format.space_after = Cm(indent), Cm(-0.5), Pt(3)
-    _run(p, f"{symbol}  ", bold=True, color=color, size=10)
-    _run(p, text, color=color, size=10)
+    p.paragraph_format.left_indent       = Cm(indent)
+    p.paragraph_format.first_line_indent = Cm(-0.5)
+    p.paragraph_format.space_after       = Pt(2)
+    _run(p, f"{symbol}  ", bold=True, color=color, size=9.5)
+    _run(p, text, color=color, size=9.5)
 
 def _section_title(doc, text: str):
     p = doc.add_paragraph()
-    p.paragraph_format.space_before, p.paragraph_format.space_after = Pt(12), Pt(5)
+    p.paragraph_format.space_before = Pt(12)
+    p.paragraph_format.space_after  = Pt(5)
     _run(p, text, bold=True, color=C_TITLE, size=12)
-    pPr, pBdr, bottom = p._p.get_or_add_pPr(), OxmlElement("w:pBdr"), OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "single"); bottom.set(qn("w:sz"), "4"); bottom.set(qn("w:space"), "1"); bottom.set(qn("w:color"), C_ACCENT)
-    pBdr.append(bottom); pPr.append(pBdr)
+    pPr    = p._p.get_or_add_pPr()
+    pBdr   = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"),   "single")
+    bottom.set(qn("w:sz"),    "4")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), C_ACCENT)
+    pBdr.append(bottom)
+    pPr.append(pBdr)
 
 def _divider(doc):
     p = doc.add_paragraph()
-    p.paragraph_format.space_before, p.paragraph_format.space_after = Pt(6), Pt(6)
-    pPr, pBdr, bot = p._p.get_or_add_pPr(), OxmlElement("w:pBdr"), OxmlElement("w:bottom")
-    bot.set(qn("w:val"), "single"); bot.set(qn("w:sz"), "4"); bot.set(qn("w:space"), "1"); bot.set(qn("w:color"), C_BORDER)
-    pBdr.append(bot); pPr.append(pBdr)
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after  = Pt(6)
+    pPr  = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bot  = OxmlElement("w:bottom")
+    bot.set(qn("w:val"),   "single")
+    bot.set(qn("w:sz"),    "4")
+    bot.set(qn("w:space"), "1")
+    bot.set(qn("w:color"), C_BORDER)
+    pBdr.append(bot)
+    pPr.append(pBdr)
 
 def _h1(doc, text: str):
     p = doc.add_paragraph()
-    p.paragraph_format.space_before, p.paragraph_format.space_after = Pt(14), Pt(7)
+    p.paragraph_format.space_before = Pt(14)
+    p.paragraph_format.space_after  = Pt(7)
     _run(p, text, bold=True, color=C_TITLE, size=14)
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# =============================================================================
 # GENERADOR DOCX
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 class ReportGenerator:
     def __init__(self, changes: List[FileChange], branch_from: str, branch_to: str, output: str):
-        self.changes, self.branch_from, self.branch_to, self.output = changes, branch_from, branch_to, output
-        self.doc = Document()
+        self.changes     = changes
+        self.branch_from = branch_from
+        self.branch_to   = branch_to
+        self.output      = output
+        self.doc         = Document()
+        self._upgrade_compatibility()
         self._page_setup()
+
+    def _upgrade_compatibility(self):
+        settings = self.doc.settings.element
+        compat   = OxmlElement('w:compat')
+        cs       = OxmlElement('w:compatSetting')
+        cs.set(qn('w:name'), 'compatibilityMode')
+        cs.set(qn('w:uri'),  'http://schemas.microsoft.com/office/word')
+        cs.set(qn('w:val'),  '15')
+        compat.append(cs)
+        settings.append(compat)
 
     def _page_setup(self):
         sec = self.doc.sections[0]
-        sec.page_width, sec.page_height = Inches(8.5), Inches(11)
-        sec.left_margin, sec.right_margin, sec.top_margin, sec.bottom_margin = Cm(2.5), Cm(2.5), Cm(2.0), Cm(2.0)
+        sec.page_width    = Inches(8.5)
+        sec.page_height   = Inches(11)
+        sec.left_margin   = Cm(2.0)
+        sec.right_margin  = Cm(2.0)
+        sec.top_margin    = Cm(2.0)
+        sec.bottom_margin = Cm(2.0)
         style = self.doc.styles["Normal"]
-        style.font.name, style.font.size = "Arial", Pt(10)
+        style.font.name = "Arial"
+        style.font.size = Pt(10)
 
     def _title(self):
-        fecha = datetime.now().strftime("%d de %B de %Y")
-        p = self.doc.add_paragraph(); p.alignment, p.paragraph_format.space_after = WD_ALIGN_PARAGRAPH.CENTER, Pt(3)
-        _run(p, "INFORME DE CAMBIOS DE CÓDIGO", bold=True, color=C_TITLE, size=20)
-        p2 = self.doc.add_paragraph(); p2.alignment, p2.paragraph_format.space_after = WD_ALIGN_PARAGRAPH.CENTER, Pt(2)
-        _run(p2, f"Rama: {self.branch_from}  →  {self.branch_to}", color=C_SUBTITLE, size=11)
-        p3 = self.doc.add_paragraph(); p3.alignment, p3.paragraph_format.space_after = WD_ALIGN_PARAGRAPH.CENTER, Pt(12)
-        _run(p3, f"Fecha: {fecha}", color=C_MUTED, size=10)
-        p4 = self.doc.add_paragraph(); p4.paragraph_format.space_after = Pt(12)
-        pPr, pBdr, bot = p4._p.get_or_add_pPr(), OxmlElement("w:pBdr"), OxmlElement("w:bottom")
-        bot.set(qn("w:val"), "single"); bot.set(qn("w:sz"), "12"); bot.set(qn("w:space"), "1"); bot.set(qn("w:color"), C_ACCENT)
-        pBdr.append(bot); pPr.append(pBdr)
+        # FIX BUG 1: Fecha en espanol con diccionario de meses
+        p = self.doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(3)
+        _run(p, "INFORME DE CAMBIOS DE CODIGO", bold=True, color=C_TITLE, size=20)
+
+        p2 = self.doc.add_paragraph()
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p2.paragraph_format.space_after = Pt(2)
+        _run(p2, f"Rama: {self.branch_from}  hacia  {self.branch_to}", color=C_SUBTITLE, size=11)
+
+        p3 = self.doc.add_paragraph()
+        p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p3.paragraph_format.space_after = Pt(12)
+        _run(p3, f"Fecha: {fecha_espanol()}", color=C_MUTED, size=10)
+
+        p4 = self.doc.add_paragraph()
+        p4.paragraph_format.space_after = Pt(12)
+        pPr  = p4._p.get_or_add_pPr()
+        pBdr = OxmlElement("w:pBdr")
+        bot  = OxmlElement("w:bottom")
+        bot.set(qn("w:val"),   "single")
+        bot.set(qn("w:sz"),    "12")
+        bot.set(qn("w:space"), "1")
+        bot.set(qn("w:color"), C_ACCENT)
+        pBdr.append(bot)
+        pPr.append(pBdr)
 
     def _summary(self):
         _h1(self.doc, "1. Tabla Resumen de Cambios")
         total_add = sum(len(f.added) for f in self.changes)
         total_del = sum(len(f.removed) for f in self.changes)
-        p = self.doc.add_paragraph(); p.paragraph_format.space_after = Pt(6)
-        _run(p, f"Archivos afectados: {len(self.changes)}   Líneas añadidas: +{total_add}   Líneas eliminadas: −{total_del}", color=C_MUTED, size=9, italic=True)
 
-        COLS = [("Archivo", 4.8), ("Categoría", 3.0), ("Tipo de Cambio", 2.6), ("Impacto detectado", 4.6)]
-        tbl = self.doc.add_table(rows=1, cols=len(COLS)); tbl.style = "Table Grid"
+        p = self.doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(6)
+        _run(
+            p,
+            f"Archivos afectados: {len(self.changes)}   "
+            f"Lineas anadidas: +{total_add}   "
+            f"Lineas eliminadas: -{total_del}",
+            color=C_MUTED, size=9, italic=True
+        )
+
+        COLS = [
+            ("Archivo",           3.8),
+            ("Categoria",         2.6),
+            ("Tipo de Cambio",    2.2),
+            ("Impacto Tecnico",   4.0),
+            ("Impacto en Deploy", 1.6),
+        ]
+        tbl = self.doc.add_table(rows=1, cols=len(COLS))
+        tbl.style = "Table Grid"
+        tbl.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _header_row(tbl, COLS)
 
         for fc in self.changes:
-            tc, bg = fc.kind_colors
-            category = FILE_CATEGORIES.get(fc.ext, Path(fc.filepath).suffix.upper() or "Archivo")
+            tc_kind, bg_kind = fc.kind_colors
+            category         = get_category(fc)
+            deploy_level     = calculate_deploy_impact(fc)
+            tc_dep, bg_dep   = impact_colors(deploy_level)
+            tech_impact      = analyze_technical_impact(fc)
+
             _data_row(tbl, [
-                (fc.filename, 4.8, C_MOD_TEXT, True, "EFF6FF"),
-                (category, 3.0, C_BODY, False, C_ROW_ALT),
-                (fc.kind_label, 2.6, tc, True, bg),
-                (analyze_impact(fc), 4.6, C_BODY, False, C_WHITE),
+                (fc.filename,   3.8, C_MOD_TEXT, True,  "EFF6FF"),
+                (category,      2.6, C_BODY,     False, C_ROW_ALT),
+                (fc.kind_label, 2.2, tc_kind,    True,  bg_kind),
+                (tech_impact,   4.0, C_BODY,     False, C_WHITE),
+                (deploy_level,  1.6, tc_dep,     True,  bg_dep),
             ])
+
         self.doc.add_paragraph()
+
+    def _render_lockfile_detail(self, fc: FileChange):
+        """Renderizado compacto para archivos de dependencias (lock files)."""
+        summary = summarize_lockfile(fc)
+        p_info  = self.doc.add_paragraph()
+        _run(
+            p_info,
+            f"Actualizacion de dependencias del proyecto. "
+            f"Cambios: +{len(fc.added)} / -{len(fc.removed)} entradas. "
+            f"Archivo gestionado automaticamente por el package manager.",
+            color=C_MUTED, size=9, italic=True
+        )
+        if summary["added"]:
+            p_a = self.doc.add_paragraph()
+            _run(p_a, "Paquetes con entradas nuevas:", bold=True, color=C_ADD_TEXT, size=9)
+            for pkg in summary["added"]:
+                _bullet(self.doc, pkg, "+", C_ADD_TEXT)
+        if summary["removed"]:
+            p_r = self.doc.add_paragraph()
+            _run(p_r, "Paquetes con entradas eliminadas:", bold=True, color=C_DEL_TEXT, size=9)
+            for pkg in summary["removed"]:
+                _bullet(self.doc, pkg, "-", C_DEL_TEXT)
+        if not summary["added"] and not summary["removed"]:
+            _bullet(self.doc, "Actualizacion de metadatos internos (integridad, resoluciones).", "-", C_MUTED)
+
+    def _render_structural_summary(self, fc: FileChange):
+        """Renderizado de resumen estructural para archivos extensos o con interfaces."""
+        p_lbl = self.doc.add_paragraph()
+        _run(p_lbl, "Resumen Estructural del archivo:", bold=True, color=C_TITLE, size=9)
+        struct = fc.extract_structure()
+
+        if struct["decorators"]:
+            p_d = self.doc.add_paragraph()
+            _run(p_d, "Decoradores detectados:", bold=True, color=C_SUBTITLE, size=9)
+            for d in struct["decorators"]:
+                _bullet(self.doc, d, "-", C_REF_TEXT, indent=1.5)
+
+        if struct["imports"]:
+            p_i = self.doc.add_paragraph()
+            _run(p_i, "Dependencias / Imports:", bold=True, color=C_SUBTITLE, size=9)
+            for imp in struct["imports"]:
+                _bullet(self.doc, imp, "-", C_BODY, indent=1.5)
+
+        if struct["entities"]:
+            p_e = self.doc.add_paragraph()
+            _run(p_e, "Estructuras Logicas (Clases / Funciones / Interfaces / Tipos):",
+                 bold=True, color=C_SUBTITLE, size=9)
+            for ent in struct["entities"]:
+                _bullet(self.doc, ent, "-", C_BODY, indent=1.5)
+
+        if struct["routes"]:
+            p_r = self.doc.add_paragraph()
+            _run(p_r, "Rutas registradas:", bold=True, color=C_SUBTITLE, size=9)
+            for rt in struct["routes"]:
+                _bullet(self.doc, rt, "-", C_MOD_TEXT, indent=1.5)
+
+        if not any(struct.values()):
+            _bullet(
+                self.doc,
+                "Contenido estructurado sin entidades detectables (datos, configuracion, markup).",
+                "-", C_BODY
+            )
+
+    def _render_line_detail(self, fc: FileChange):
+        """Renderizado linea a linea para cambios acotados con clasificacion de razon."""
+        if fc.added:
+            p_add = self.doc.add_paragraph()
+            _run(p_add, "Lineas anadidas:", bold=True, color=C_ADD_TEXT, size=9)
+            for line in fc.added:
+                _bullet(self.doc, line, "+", C_ADD_TEXT)
+
+        if fc.removed:
+            p_rem = self.doc.add_paragraph()
+            p_rem.paragraph_format.space_before = Pt(4)
+            _run(p_rem, "Lineas eliminadas:", bold=True, color=C_DEL_TEXT, size=9)
+
+            TAG_COLORS = {
+                "Linter":        C_ADD_TEXT,
+                "Limpieza":      C_MUTED,
+                "Debug":         C_MUTED,
+                "Doc":           C_MUTED,
+                "Deuda tecnica": C_REF_TEXT,
+                "Config":        C_MOD_TEXT,
+                "Refactor":      C_REF_TEXT,
+                "Test":          C_SUBTITLE,
+            }
+
+            for line in fc.removed:
+                reason = fc.classify_removed_line(line)
+                if reason:
+                    tag_match = re.match(r'\[([^\]]+)\]\s*(.*)', reason)
+                    if tag_match:
+                        tag_key  = tag_match.group(1)
+                        tag_desc = tag_match.group(2)
+                        tc_tag   = TAG_COLORS.get(tag_key, C_SUBTITLE)
+                        p_line   = self.doc.add_paragraph()
+                        p_line.paragraph_format.left_indent       = Cm(1.0)
+                        p_line.paragraph_format.first_line_indent = Cm(-0.5)
+                        p_line.paragraph_format.space_after       = Pt(2)
+                        _run(p_line, "-  ", bold=True, color=C_DEL_TEXT, size=9)
+                        _run(p_line, line, color=C_DEL_TEXT, size=9)
+                        _run(p_line, f"  [{tag_key}: {tag_desc}]",
+                             bold=True, color=tc_tag, size=8, italic=True)
+                    else:
+                        _bullet(self.doc, f"{line}  ({reason})", "-", C_DEL_TEXT)
+                else:
+                    _bullet(self.doc, line, "-", C_DEL_TEXT)
 
     def _detail(self):
         _h1(self.doc, "2. Detalle de Cambios por Archivo")
 
         for i, fc in enumerate(self.changes):
             _section_title(self.doc, fc.filename)
-            p = self.doc.add_paragraph(); p.paragraph_format.space_after = Pt(4)
-            _run(p, fc.filepath, color=C_MUTED, size=8, italic=True)
+
+            p_path = self.doc.add_paragraph()
+            p_path.paragraph_format.space_after = Pt(3)
+            _run(p_path, fc.filepath, color=C_MUTED, size=8, italic=True)
 
             if fc.contexts:
                 p_ctx = self.doc.add_paragraph()
+                p_ctx.paragraph_format.space_after = Pt(3)
                 _run(p_ctx, "Bloques / Funciones afectadas: ", bold=True, color=C_SUBTITLE, size=9)
                 _run(p_ctx, ", ".join(fc.contexts), color=C_BODY, size=9, italic=True)
 
-            p2 = self.doc.add_paragraph(); p2.paragraph_format.space_after = Pt(6)
-            _run(p2, f"+{len(fc.added)} líneas añadidas   −{len(fc.removed)} líneas eliminadas", color=C_MUTED, size=8)
+            deploy_level = calculate_deploy_impact(fc)
+            tc_dep, _    = impact_colors(deploy_level)
+            p_stats = self.doc.add_paragraph()
+            p_stats.paragraph_format.space_after = Pt(4)
+            _run(p_stats, f"+{len(fc.added)} anadidas   -{len(fc.removed)} eliminadas   ",
+                 color=C_MUTED, size=8)
+            _run(p_stats, f"Impacto en deploy: {deploy_level}", bold=True, color=tc_dep, size=8)
 
-            # LÓGICA DE RESUMEN INTELIGENTE
+            # Elegir estrategia de renderizado
             if fc.is_binary:
-                _bullet(self.doc, "El archivo es binario. No se muestra contenido de texto.", "ℹ", C_MUTED)
-            elif (fc.kind == 'added' and len(fc.added) > 30) or len(fc.added) + len(fc.removed) > 100:
-                _run(self.doc.add_paragraph(), "Resumen Estructural (Archivo extenso):", bold=True, color=C_TITLE, size=9)
-                struct = fc.extract_structure()
-                
-                if struct["imports"]:
-                    _bullet(self.doc, "Dependencias / Imports detectados:", "📦", C_SUBTITLE)
-                    for imp in struct["imports"]: _bullet(self.doc, imp, "·", C_BODY, indent=1.5)
-                
-                if struct["entities"]:
-                    _bullet(self.doc, "Estructuras Lógicas (Clases/Funciones):", "⚙", C_SUBTITLE)
-                    for ent in struct["entities"]: _bullet(self.doc, ent, "·", C_BODY, indent=1.5)
-                    
-                if not struct["imports"] and not struct["entities"]:
-                    _bullet(self.doc, "Se añadieron datos planos o contenido estructurado (ej. JSON/HTML amplio).", "📄", C_BODY)
+                _bullet(self.doc, "Archivo binario. No se puede mostrar contenido de texto.",
+                        "-", C_MUTED)
+            elif fc.is_lockfile:
+                # FIX BUG 2: Lock files tienen renderizado compacto propio
+                self._render_lockfile_detail(fc)
+            elif fc.needs_structural_summary:
+                # FIX BUG 2: Umbral inteligente por tipo de archivo
+                self._render_structural_summary(fc)
             else:
-                if fc.added:
-                    _run(self.doc.add_paragraph(), "Líneas añadidas:", bold=True, color=C_ADD_TEXT, size=9)
-                    for line in fc.added: _bullet(self.doc, line, "✔", C_ADD_TEXT)
-
-                if fc.removed:
-                    p3 = self.doc.add_paragraph(); p3.paragraph_format.space_before = Pt(4)
-                    _run(p3, "Líneas eliminadas:", bold=True, color=C_DEL_TEXT, size=9)
-                    for line in fc.removed: _bullet(self.doc, line, "✖", C_DEL_TEXT)
+                self._render_line_detail(fc)
 
             if not fc.added and not fc.removed and not fc.is_binary:
-                p4 = self.doc.add_paragraph()
-                _run(p4, "Archivo sin modificaciones en el código fuente. Posible cambio de propiedades (ej. chmod), creación de archivo vacío o renombramiento.", color=C_MUTED, size=9, italic=True)
+                p_empty = self.doc.add_paragraph()
+                _run(
+                    p_empty,
+                    "Sin modificaciones en el codigo fuente. Posible cambio de "
+                    "permisos, archivo vacio o renombramiento.",
+                    color=C_MUTED, size=9, italic=True
+                )
 
             if i < len(self.changes) - 1:
                 _divider(self.doc)
 
         self.doc.add_paragraph()
 
+    def _impact_legend(self):
+        _h1(self.doc, "3. Leyenda de Niveles de Impacto en Deploy")
+
+        legend = [
+            ("Nula",
+             "Sin riesgo. Documentacion, solo linter/formatter o configuracion menor."),
+            ("Leve",
+             "Archivo de dependencias, nuevo archivo aislado o cambio estetico."),
+            ("Baja",
+             "Nuevo componente/servicio sin contratos externos. Logica interna acotada."),
+            ("Media",
+             "Cambio en logica de negocio, llamadas HTTP, rutas o estado compartido."),
+            ("Alta",
+             "Interfaces/tipos exportados, modulos Angular, guards o archivos de entorno."),
+            ("Critica",
+             "Autenticacion, JWT, passwords, migraciones de BD o contratos de API externa."),
+        ]
+
+        tbl = self.doc.add_table(rows=1, cols=2)
+        tbl.style = "Table Grid"
+        tbl.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _header_row(tbl, [("Nivel", 2.5), ("Descripcion del criterio", 11.7)])
+
+        for level, desc in legend:
+            tc_l, bg_l = impact_colors(level)
+            _data_row(tbl, [
+                (level, 2.5,  tc_l,   True,  bg_l),
+                (desc,  11.7, C_BODY, False, C_WHITE),
+            ])
+
+        self.doc.add_paragraph()
+
     def _recommendations(self):
-        _h1(self.doc, "3. Recomendaciones antes del Merge")
+        _h1(self.doc, "4. Recomendaciones antes del Merge")
         recs = analyze_recommendations(self.changes)
-        p = self.doc.add_paragraph(); p.paragraph_format.space_after = Pt(7)
-        _run(p, "Recomendaciones generadas lógicamente a partir del código modificado:", color=C_BODY, size=10)
-        for rec in recs: _bullet(self.doc, rec, "➤", C_MOD_TEXT)
+        p = self.doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(7)
+        _run(
+            p,
+            "Recomendaciones generadas a partir del analisis del codigo modificado:",
+            color=C_BODY, size=10
+        )
+        for rec in recs:
+            _bullet(self.doc, rec, "->", C_MOD_TEXT)
         self.doc.add_paragraph()
 
     def _footer(self):
         _divider(self.doc)
-        p = self.doc.add_paragraph(); p.alignment, p.paragraph_format.space_before = WD_ALIGN_PARAGRAPH.CENTER, Pt(6)
+        p = self.doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_before = Pt(6)
         total_add = sum(len(f.added) for f in self.changes)
         total_del = sum(len(f.removed) for f in self.changes)
-        _run(p, f"Archivos: {len(self.changes)}  ·  +{total_add} líneas  ·  −{total_del} líneas  ·  Informe Generado automaticamente con Python - Ryu Gabo -", color=C_MUTED, size=8, italic=True)
+        _run(
+            p,
+            f"Archivos: {len(self.changes)}  |  "
+            f"+{total_add} lineas  |  "
+            f"-{total_del} lineas  |  "
+            f"Archivo generado automaticamente - Ryu Gabo -",
+            color=C_MUTED, size=9.5, italic=True
+        )
 
     def generate(self) -> str:
-        self._title(); self._summary(); self._detail(); self._recommendations(); self._footer()
+        self._title()
+        self._summary()
+        self._detail()
+        self._impact_legend()
+        self._recommendations()
+        self._footer()
         self.doc.save(self.output)
         return self.output
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI Y EJECUCIÓN
-# ─────────────────────────────────────────────────────────────────────────────
+
+# =============================================================================
+# CLI Y EJECUCION
+# =============================================================================
 def find_input(arg: Optional[str]) -> Path:
     if arg:
         p = Path(arg)
         if not p.exists():
-            print(f"[ERROR] No se encontró: {p}", file=sys.stderr)
+            print(f"[ERROR] No se encontro: {p}", file=sys.stderr)
             sys.exit(1)
         return p
-
     for candidate in (Path.cwd() / DEFAULT_INPUT, Path(__file__).parent / DEFAULT_INPUT):
-        if candidate.exists(): return candidate
-
-    print(f"[ERROR] No se encontró '{DEFAULT_INPUT}'.\nGenera el archivo con:\n  git --no-pager diff --staged > {DEFAULT_INPUT}", file=sys.stderr)
+        if candidate.exists():
+            return candidate
+    print(
+        f"[ERROR] No se encontro '{DEFAULT_INPUT}'.\n"
+        f"Genera el archivo con:\n"
+        f"  git --no-pager diff --staged -U9999 > {DEFAULT_INPUT}",
+        file=sys.stderr
+    )
     sys.exit(1)
 
+
 def main():
-    ap = argparse.ArgumentParser(description="Convierte 'informe.txt' en un informe .docx profesional analizando la lógica.")
-    ap.add_argument("--input", "-i", default=None, help=f"Archivo diff (default: {DEFAULT_INPUT})")
-    ap.add_argument("--output", "-o", default=None, help=f"Archivo salida (default: {DEFAULT_OUTPUT})")
-    ap.add_argument("--branch-from", "-bf", default="feature/cambios", help="Rama origen")
-    ap.add_argument("--branch-to", "-bt", default="develop", help="Rama destino")
+    ap = argparse.ArgumentParser(
+        description="Convierte 'informe.txt' (git diff) en un informe .docx profesional."
+    )
+    ap.add_argument("--input",       "-i",  default=None,       help=f"Archivo diff (default: {DEFAULT_INPUT})")
+    ap.add_argument("--output",      "-o",  default=None,       help=f"Archivo salida (default: {DEFAULT_OUTPUT})")
+    ap.add_argument("--branch-from", "-bf", default="gabotest", help="Rama origen  (default: gabotest)")
+    ap.add_argument("--branch-to",   "-bt", default="develop",  help="Rama destino (default: develop)")
     args = ap.parse_args()
 
     input_path = find_input(args.input)
@@ -464,7 +1263,7 @@ def main():
 
     text = clean(input_path.read_text(encoding="utf-8", errors="replace"))
     if not text.strip():
-        print("[ERROR] El archivo está vacío.", file=sys.stderr)
+        print("[ERROR] El archivo esta vacio.", file=sys.stderr)
         sys.exit(1)
 
     changes = DiffParser().parse(text)
@@ -473,8 +1272,15 @@ def main():
         sys.exit(1)
 
     output = args.output or str(input_path.parent / DEFAULT_OUTPUT)
-    result = ReportGenerator(changes=changes, branch_from=args.branch_from, branch_to=args.branch_to, output=output).generate()
-    print(f"\n[OK] Informe generado exitosamente: {result}")
+    result = ReportGenerator(
+        changes=changes,
+        branch_from=args.branch_from,
+        branch_to=args.branch_to,
+        output=output
+    ).generate()
+
+    print(f"\n[OK] Informe generado: {result}")
+
 
 if __name__ == "__main__":
     main()
