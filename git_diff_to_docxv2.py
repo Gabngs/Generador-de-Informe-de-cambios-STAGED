@@ -971,6 +971,7 @@ class ESLintFileReport:
     corrections: List[ESLintFinding] = field(default_factory=list)
     violations:  List[ESLintFinding] = field(default_factory=list)
     functional:  List[str]           = field(default_factory=list)
+    removed_had_violations: bool     = False   # True si alguna línea eliminada tenía patrón ESLint
 
 
 class ESLintAngularAnalyzer:
@@ -1400,6 +1401,19 @@ class ESLintAngularAnalyzer:
                         report.violations.append(finding)
             else:
                 report.functional.append(a_stripped)
+
+        # ── Detectar si las líneas ELIMINADAS tenían patrones ESLint ─────────
+        # Esto indica que el cambio fue una corrección ESLint aunque el
+        # emparejamiento añadida↔eliminada no haya podido formalizarse.
+        for removed_l in fc.removed:
+            test_finding: Optional[ESLintFinding] = None
+            if is_html:
+                test_finding = self.analyze_html_line(removed_l, "")
+            elif is_ts:
+                test_finding = self.analyze_ts_line(removed_l, "", fc.full_content)
+            if test_finding:
+                report.removed_had_violations = True
+                break
 
         return report
 
@@ -2087,11 +2101,16 @@ class ReportGenerator:
         if not (is_html or is_ts):
             return
         if not eslint_report.corrections and not eslint_report.violations:
-            p_ok = self.doc.add_paragraph()
-            p_ok.paragraph_format.space_before = Pt(4)
-            _run(p_ok, "Análisis ESLint: ", bold=True, color=C_TITLE, size=9)
-            _run(p_ok, "No se detectaron correcciones ni violaciones ESLint en las líneas añadidas.",
-                 color=C_MUTED, size=9, italic=True)
+            # Si las líneas eliminadas ya tenían violaciones ESLint, el cambio
+            # fue una corrección: no mostrar el mensaje (sería contradictorio).
+            # Solo se muestra para archivos nuevos o cambios funcionales sin relación con ESLint.
+            if not eslint_report.removed_had_violations:
+                p_ok = self.doc.add_paragraph()
+                p_ok.paragraph_format.space_before = Pt(4)
+                _run(p_ok, "Análisis ESLint: ", bold=True, color=C_TITLE, size=9)
+                _run(p_ok,
+                     "No se detectaron correcciones ni violaciones ESLint en las líneas añadidas.",
+                     color=C_MUTED, size=9, italic=True)
             return
 
         # ── Correcciones ESLint ───────────────────────────────────────────────
@@ -2319,6 +2338,7 @@ class ReportGenerator:
             COLS_C = [("#", 0.5), ("Regla ESLint", 8.5), ("Veces corregida", 2.2), ("Severidad", 1.5)]
             tbl_c = self.doc.add_table(rows=1, cols=len(COLS_C))
             tbl_c.style = "Table Grid"
+            tbl_c.alignment = WD_ALIGN_PARAGRAPH.CENTER
             _header_row(tbl_c, COLS_C)
             for rank, (rule, count) in enumerate(corr_counter.most_common(10), 1):
                 _data_row(tbl_c, [
@@ -2348,12 +2368,8 @@ class ReportGenerator:
             self.doc.add_paragraph()
 
         if not all_corrections and not all_violations:
-            p_ok = self.doc.add_paragraph()
-            _run(p_ok,
-                 "No se detectaron correcciones ni violaciones ESLint en ningún archivo "
-                 "TypeScript o HTML del diff.",
-                 color=C_MUTED, size=9, italic=True)
             self.doc.add_paragraph()
+            return
 
     def _footer(self):
         _divider(self.doc)
