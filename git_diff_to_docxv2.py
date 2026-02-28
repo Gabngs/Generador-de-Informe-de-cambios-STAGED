@@ -120,7 +120,9 @@ class FileChange:
                        '.directive.ts', '.guard.ts', '.interceptor.ts',
                        '.reducer.ts', '.action.ts', '.effect.ts', '.selector.ts',
                        '.resolver.ts', '.model.ts', '.interface.ts', '.enum.ts',
-                       '.helper.ts', '.util.ts', '.config.ts', '.constant.ts'):
+                       '.helper.ts', '.util.ts', '.config.ts', '.constant.ts',
+                       # PHP / Laravel
+                       '.blade.php'):
             if name.endswith(double):
                 return double
         return Path(self.filepath).suffix.lower()
@@ -597,6 +599,9 @@ FILE_CATEGORIES: Dict[str, str] = {
     '.xml':             'XML / Config',
     '.graphql':         'Esquema GraphQL',
     '.prisma':          'Schema Prisma ORM',
+    # PHP / Laravel
+    '.php':             'PHP Backend',
+    '.blade.php':       'Vista Blade PHP',
 }
 
 def get_category(fc: FileChange) -> str:
@@ -653,6 +658,27 @@ IMPACT_SIGNALS: List[Tuple[re.Pattern, str]] = [
      'Internacionalizacion (i18n)'),
     (re.compile(r'canActivate|canLoad|canMatch|menuGuard|authGuard'),
      'Guards de ruta (control de acceso)'),
+    # --- PHP / Laravel ---
+    (re.compile(r'public\s+function\s+\w+|private\s+function\s+\w+|protected\s+function\s+\w+'),
+     'Modificacion de metodo de clase PHP'),
+    (re.compile(r'\?\?|\?\?=|\?->|\$\w+\s*\?\s*\$\w+->|\$\w+\s*\?\s*\$\w+\s*:\s*', re.I),
+     'Guard de nulidad / null-coalescing en logica PHP'),
+    (re.compile(r'->where\s*\(|->select\s*\(|->with\s*\(|->find\s*\(|->create\s*\(|->update\s*\(|->save\s*\(|->delete\s*\(', re.I),
+     'Operacion Eloquent ORM (consulta/persistencia)'),
+    (re.compile(r'Route::(get|post|put|delete|patch|resource|apiResource)\s*\(', re.I),
+     'Definicion de ruta de API/web Laravel'),
+    (re.compile(r'->middleware\s*\(|\bMiddleware\b', re.I),
+     'Middleware de autenticacion/autorizacion PHP'),
+    (re.compile(r'return\s+response\s*\(|->json\s*\(|->response\s*\(', re.I),
+     'Respuesta de endpoint HTTP'),
+    (re.compile(r'->belongsTo\s*\(|->hasMany\s*\(|->hasOne\s*\(|->belongsToMany\s*\(|->morphMany\s*\('),
+     'Relacion Eloquent entre modelos'),
+    (re.compile(r'\$request->|Request\s+\$\w+|->validated\s*\(|->rules\s*\('),
+     'Procesamiento/validacion de peticion HTTP'),
+    (re.compile(r'\bLog::|\$this->error\b|\$this->success\b|ApiResponse', re.I),
+     'Trazabilidad / respuesta estandarizada de API PHP'),
+    (re.compile(r'->paginate\s*\(|->get\s*\(|->first\s*\(|->count\s*\(', re.I),
+     'Consulta de coleccion Eloquent'),
 ]
 # =============================================================================
 # MOTOR DE ANALISIS SEMANTICO CONTEXTUAL
@@ -1001,12 +1027,56 @@ def calculate_deploy_impact(fc: FileChange) -> str:
     if fc.ext == '.md':
         return "Nula"
 
+    # --- PHP / Laravel: scoring por contexto del archivo ---
+    if fc.ext == '.php':
+        filepath_lower = fc.filepath.lower().replace('\\', '/')
+        score += 20  # base: cualquier archivo PHP en produccion tiene impacto
+
+        # Controlador de API: modifica contratos de respuesta
+        if re.search(r'controller', filepath_lower):
+            score += 15
+        # Middleware: intercepta todas las peticiones
+        if re.search(r'middleware', filepath_lower):
+            score += 35
+        # Migracion: altera el esquema de base de datos
+        if re.search(r'migration[s]?/', filepath_lower):
+            score += 55
+        # Rutas: define o modifica endpoints publicos
+        if re.search(r'routes?/(api|web|channels|console)\.php', filepath_lower):
+            score += 30
+        # Configuracion de framework
+        if re.search(r'config/', filepath_lower):
+            score += 25
+        # Seeder / Factory: populate de datos, riesgo bajo
+        if re.search(r'seeder|factory', filepath_lower):
+            score = min(score, 25)
+        # Vista Blade: solo UI, impacto reducido
+        if '.blade.' in filepath_lower:
+            score = min(score, 20)
+
+        # Bonus por signales en el codigo cambiado
+        if re.search(r'->where\s*\(|->select\s*\(|->save\s*\(|->create\s*\(|->update\s*\(|->delete\s*\(', all_lines, re.I):
+            score += 20  # operaciones ORM directas
+        if re.search(r'return\s+response\s*\(|->json\s*\(|\$this->success\b|\$this->error\b', all_lines, re.I):
+            score += 15  # modifica respuesta de la API
+        if re.search(r'\?\?|\?->|\?\?=', all_lines):
+            score += 10  # null guards (correccion de bug potencial)
+        if re.search(r'\blog::|try\s*\{|catch\s*\(\$e\b|catch\s*\(Exception', all_lines, re.I):
+            score += 10  # manejo de excepciones
+        if re.search(r'auth\s*\(|can\s*\(|Gate::|\bpolicy\b', all_lines, re.I):
+            score += 20  # logica de autorizacion
+        if re.search(r'->belongsTo\s*\(|->hasMany\s*\(|->hasOne\s*\(|->belongsToMany\s*\(', all_lines):
+            score += 12  # relaciones entre modelos
+        if re.search(r'->paginate\s*\(|->get\s*\(|->first\s*\(|->with\s*\(', all_lines, re.I):
+            score += 8   # consulta de coleccion
+
     # Bonus por magnitud
     total_lines = n_add + n_del
     if total_lines > 200:   score += 20
     elif total_lines > 100: score += 12
     elif total_lines > 50:  score += 6
     elif total_lines > 20:  score += 3
+    elif total_lines > 5:   score += 1  # cambios quirurgicos siguen puntuando
 
     # Archivo nuevo: cap de impacto
     if fc.kind == 'added' and score < 40:
