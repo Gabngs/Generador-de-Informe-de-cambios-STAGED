@@ -916,6 +916,494 @@ class ChangeRelationAnalyzer:
         return insights[:6]
 
 
+# =============================================================================
+# MOTOR DE ANÁLISIS ESLINT ANGULAR (Angular 16 · strict mode)
+# Reglas activas según .eslintrc.json del proyecto:
+#   .html → @angular-eslint/template/recommended  (reglas 16-18)
+#   .ts   → @angular-eslint/recommended            (reglas 1-15)
+# =============================================================================
+
+# Eventos DOM nativos que no deben usarse como nombre de @Output()
+DOM_NATIVE_EVENTS: frozenset = frozenset({
+    'click', 'focus', 'blur', 'change', 'input', 'submit',
+    'keyup', 'keydown', 'keypress', 'mouseenter', 'mouseleave',
+    'mouseover', 'mouseout', 'mouseup', 'mousedown', 'dblclick',
+    'contextmenu', 'scroll', 'resize', 'load', 'error', 'abort',
+    'select', 'reset', 'drag', 'dragstart', 'dragend', 'dragenter',
+    'dragleave', 'dragover', 'drop', 'touchstart', 'touchend',
+    'touchmove', 'touchcancel', 'wheel', 'copy', 'cut', 'paste',
+    'beforeinput',
+})
+
+# Hooks de ciclo de vida Angular y su interfaz correspondiente
+LIFECYCLE_HOOKS: frozenset = frozenset({
+    'ngOnInit', 'ngOnDestroy', 'ngOnChanges', 'ngDoCheck',
+    'ngAfterContentInit', 'ngAfterContentChecked',
+    'ngAfterViewInit', 'ngAfterViewChecked',
+})
+
+LIFECYCLE_INTERFACES: Dict[str, str] = {
+    'ngOnInit':              'OnInit',
+    'ngOnDestroy':           'OnDestroy',
+    'ngOnChanges':           'OnChanges',
+    'ngDoCheck':             'DoCheck',
+    'ngAfterContentInit':    'AfterContentInit',
+    'ngAfterContentChecked': 'AfterContentChecked',
+    'ngAfterViewInit':       'AfterViewInit',
+    'ngAfterViewChecked':    'AfterViewChecked',
+}
+
+
+@dataclass
+class ESLintFinding:
+    """Representa una corrección o violación ESLint detectada en una línea de diff."""
+    rule:         str   # ej: "@angular-eslint/template/eqeqeq"
+    severity:     str   # "ERROR"
+    category:     str   # "CORRECCION" | "VIOLACION"
+    line_added:   str   # línea nueva  (prefijo +)
+    line_removed: str   # línea previa (prefijo -), puede ser ""
+    description:  str   # descripción legible
+
+
+@dataclass
+class ESLintFileReport:
+    """Resultado del análisis ESLint de un archivo."""
+    corrections: List[ESLintFinding] = field(default_factory=list)
+    violations:  List[ESLintFinding] = field(default_factory=list)
+    functional:  List[str]           = field(default_factory=list)
+
+
+class ESLintAngularAnalyzer:
+    """
+    Motor de análisis ESLint para proyectos Angular 16 strict mode.
+
+    Archivos .html  → reglas 16, 17, 18  (template/recommended)
+    Archivos .ts    → reglas  1-15       (@angular-eslint/recommended)
+
+    Reglas NO activas (no se reportan): no-call-expression, no-any,
+    no-conflicting-lifecycle, @typescript-eslint/**, accesibilidad.
+    """
+
+    # ── Patrones HTML ────────────────────────────────────────────────────────
+    # Extrae contenido entre comillas de atributos Angular y de interpolaciones
+    _RE_EXPR_ATTR   = re.compile(
+        r'(?:[\[(*][\w.@$-]+\]?|\*\w+|#\w+)\s*=\s*"([^"]*)"'
+    )
+    _RE_EXPR_INTERP = re.compile(r'\{\{([^}]+)\}\}')
+
+    # Regla 17: == o != que NO sean === ni !==
+    # Lookbehind/lookahead para evitar capturar ===, !==, <=, >=
+    _RE_EQEQ        = re.compile(r'(?<![=!<>])={2}(?!=)|(?<![!<>])!={1}(?!=)')
+    _RE_STRICT      = re.compile(r'===|!==')
+
+    # Regla 16: banana-in-box — patrón ([attr])=
+    _RE_BANANA      = re.compile(r'\(\[[\w.]+\]\)\s*=')
+
+    # Regla 18: no-negated-async — !(expr | async)
+    _RE_NEG_ASYNC   = re.compile(r'!\s*\([^)]*\|\s*async\s*\)')
+
+    # Regla 19: accessibility-table-scope — <th> debe tener scope="col"|"row"|"colgroup"|"rowgroup"
+    # Incluida en template/recommended v16.3.1; el preset accessibility está comentado en .eslintrc.json
+    # pero esta regla específica ya viene en recommended desde v15+.
+    _RE_TH_SCOPE    = re.compile(r'<th\b[^>]*\bscope\s*=', re.I)
+    _RE_TH_TAG      = re.compile(r'<th\b', re.I)
+
+    # ── Patrones TS ──────────────────────────────────────────────────────────
+    _RE_COMP_DECOR  = re.compile(r'@Component\s*\(')
+    _RE_DIR_DECOR   = re.compile(r'@Directive\s*\(')
+    _RE_PIPE_DECOR  = re.compile(r'@Pipe\s*\(')
+
+    # Regla 4: método de ciclo de vida con cuerpo vacío
+    _RE_EMPTY_HOOK  = re.compile(
+        r'\b(' + '|'.join(LIFECYCLE_HOOKS) + r')\s*\([^)]*\)\s*:\s*\w*\s*\{\s*\}|\b('
+        + '|'.join(LIFECYCLE_HOOKS) + r')\s*\([^)]*\)\s*\{\s*\}'
+    )
+
+    # Regla 5: host property en decorador
+    _RE_HOST_PROP   = re.compile(r'\bhost\s*:\s*\{')
+
+    # Regla 6: @Input con alias (cualquier argumento de cadena)
+    _RE_INPUT_ALIAS  = re.compile(r"@Input\s*\(\s*['\"](\w+)['\"]\s*\)")
+    # Regla 10: @Output con alias
+    _RE_OUTPUT_ALIAS = re.compile(r"@Output\s*\(\s*['\"](\w+)['\"]\s*\)")
+
+    # Reglas 7/11: inputs/outputs en metadata del decorador
+    _RE_INPUTS_META  = re.compile(r'\binputs\s*:\s*\[')
+    _RE_OUTPUTS_META = re.compile(r'\boutputs\s*:\s*\[')
+
+    # Regla 8: nombre de la variable después de @Output()
+    _RE_OUTPUT_DECL  = re.compile(
+        r'@Output\s*\(\s*\)\s+(?:public\s+|private\s+|protected\s+|readonly\s+)?(\w+)'
+    )
+
+    # Regla 9: @Output cuyo nombre empieza por "on"
+    _RE_OUTPUT_ON    = re.compile(
+        r'@Output\s*\([^)]*\)\s+(?:public\s+|private\s+|protected\s+|readonly\s+)?on[A-Z]\w*'
+    )
+
+    # Regla 12: método de ciclo de vida declarado en la clase
+    _RE_HOOK_METHOD  = re.compile(r'\b(' + '|'.join(LIFECYCLE_HOOKS) + r')\s*\(')
+    _RE_IMPLEMENTS   = re.compile(r'\bimplements\b([^{]+)')
+
+    # Regla 13: @Pipe sin PipeTransform
+    _RE_PIPE_TRANSFORM = re.compile(r'\bimplements\b[^{]*\bPipeTransform\b')
+
+    # Reglas 14/15: selector
+    _RE_SELECTOR     = re.compile(r"\bselector\s*:\s*['\"]([^'\"]+)['\"]")
+
+    # Sufijos obligatorios (reglas 1 y 3)
+    _RE_CLASS_DEF    = re.compile(r'\bclass\s+(\w+)')
+
+    # ── Helpers internos ─────────────────────────────────────────────────────
+
+    def _has_loose_equality(self, text: str) -> bool:
+        """Devuelve True si 'text' contiene == o != no estrictos."""
+        masked = self._RE_STRICT.sub('\x00\x00\x00', text)
+        return bool(self._RE_EQEQ.search(masked))
+
+    def _extract_angular_expressions(self, line: str) -> List[str]:
+        """Extrae el contenido de atributos Angular e interpolaciones."""
+        exprs: List[str] = []
+        for m in self._RE_EXPR_ATTR.finditer(line):
+            exprs.append(m.group(1))
+        for m in self._RE_EXPR_INTERP.finditer(line):
+            exprs.append(m.group(1))
+        return exprs
+
+    def _line_has_eqeqeq(self, line: str) -> bool:
+        exprs = self._extract_angular_expressions(line)
+        return any(self._has_loose_equality(e) for e in exprs)
+
+    def _best_removed_match(self, added_l: str, removed_lines: List[str]) -> str:
+        """Encuentra la línea eliminada más similar a la añadida (ratio > 0.5)."""
+        if not removed_lines:
+            return ""
+        a_ns = re.sub(r'\s+', '', added_l)
+        best, best_score = "", 0.0
+        for r_l in removed_lines:
+            r_ns = re.sub(r'\s+', '', r_l)
+            common = sum(1 for c in set(a_ns) if c in r_ns)
+            total  = max(len(a_ns), len(r_ns), 1)
+            score  = common / total
+            if score > best_score:
+                best_score, best = score, r_l
+        return best if best_score > 0.50 else ""
+
+    # ── Análisis HTML ────────────────────────────────────────────────────────
+
+    def analyze_html_line(self, added: str, removed: str) -> Optional[ESLintFinding]:
+        a, r = added.strip(), removed.strip()
+
+        # Regla 17 – eqeqeq
+        a_has = self._line_has_eqeqeq(a)
+        r_has = self._line_has_eqeqeq(r) if r else False
+        if r_has and not a_has:
+            return ESLintFinding(
+                rule="@angular-eslint/template/eqeqeq", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description="Corrección de igualdad estricta (== → === o != → !==) en expresión de plantilla.",
+            )
+        if a_has and not r_has:
+            return ESLintFinding(
+                rule="@angular-eslint/template/eqeqeq", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="Uso de == o != en expresión de plantilla Angular. Debe usarse === o !==.",
+            )
+
+        # Regla 16 – banana-in-box
+        a_ban = bool(self._RE_BANANA.search(a))
+        r_ban = bool(self._RE_BANANA.search(r)) if r else False
+        if a_ban and not r_ban:
+            return ESLintFinding(
+                rule="@angular-eslint/template/banana-in-box", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="Two-way binding incorrecto: se usa ([attr])= en lugar de [(attr)]=.",
+            )
+        if r_ban and not a_ban:
+            return ESLintFinding(
+                rule="@angular-eslint/template/banana-in-box", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description="Corrección de two-way binding: sintaxis ([]) reemplazada por [()].",
+            )
+
+        # Regla 18 – no-negated-async
+        a_neg = bool(self._RE_NEG_ASYNC.search(a))
+        r_neg = bool(self._RE_NEG_ASYNC.search(r)) if r else False
+        if a_neg and not r_neg:
+            return ESLintFinding(
+                rule="@angular-eslint/template/no-negated-async", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="Negación directa sobre pipe async ( !(obs$ | async) ). Usar variable con 'as'.",
+            )
+        if r_neg and not a_neg:
+            return ESLintFinding(
+                rule="@angular-eslint/template/no-negated-async", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description="Corrección: se elimina el patrón !(... | async) del template.",
+            )
+
+        # Regla 19 – accessibility-table-scope
+        # Activa: viene en template/recommended v16.3.1 (el preset accessibility
+        # está comentado en .eslintrc.json pero esta regla ya pertenece a recommended).
+        a_th = bool(self._RE_TH_TAG.search(a))
+        r_th = bool(self._RE_TH_TAG.search(r)) if r else False
+        a_sc = bool(self._RE_TH_SCOPE.search(a)) if a_th else False
+        r_sc = bool(self._RE_TH_SCOPE.search(r)) if r_th else False
+
+        if a_th and a_sc and r_th and not r_sc:
+            return ESLintFinding(
+                rule="@angular-eslint/template/accessibility-table-scope", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description=(
+                    "Corrección: se añade scope=\"col\"/\"row\" al elemento <th> "
+                    "para cumplir accesibilidad de tablas HTML."
+                ),
+            )
+        if a_th and not a_sc and not (r_th and r_sc):
+            return ESLintFinding(
+                rule="@angular-eslint/template/accessibility-table-scope", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="Elemento <th> sin atributo scope. Debe añadirse scope=\"col\" o scope=\"row\".",
+            )
+
+        return None
+
+    # ── Análisis TypeScript ──────────────────────────────────────────────────
+
+    def analyze_ts_line(
+        self,
+        added: str,
+        removed: str,
+        full_content: List[str],
+    ) -> Optional[ESLintFinding]:
+        a, r = added.strip(), removed.strip()
+        full_text = "\n".join(full_content)
+
+        # Regla 4 – no-empty-lifecycle-method
+        if self._RE_EMPTY_HOOK.search(a) and not self._RE_EMPTY_HOOK.search(r):
+            return ESLintFinding(
+                rule="@angular-eslint/no-empty-lifecycle-method", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="Método de ciclo de vida declarado con cuerpo vacío {}.",
+            )
+        if self._RE_EMPTY_HOOK.search(r) and not self._RE_EMPTY_HOOK.search(a):
+            return ESLintFinding(
+                rule="@angular-eslint/no-empty-lifecycle-method", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description="Corrección: se elimina o implementa el método de ciclo de vida vacío.",
+            )
+
+        # Regla 5 – no-host-metadata-property
+        if self._RE_HOST_PROP.search(a) and not self._RE_HOST_PROP.search(r):
+            return ESLintFinding(
+                rule="@angular-eslint/no-host-metadata-property", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="Propiedad 'host:' en decorador. Usar @HostListener / @HostBinding.",
+            )
+        if self._RE_HOST_PROP.search(r) and not self._RE_HOST_PROP.search(a):
+            return ESLintFinding(
+                rule="@angular-eslint/no-host-metadata-property", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description="Corrección: se elimina propiedad 'host:' del decorador.",
+            )
+
+        # Regla 6 – no-input-rename
+        m_in_a = self._RE_INPUT_ALIAS.search(a)
+        m_in_r = self._RE_INPUT_ALIAS.search(r) if r else None
+        if m_in_a and not m_in_r:
+            return ESLintFinding(
+                rule="@angular-eslint/no-input-rename", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description=f"@Input() con alias '{m_in_a.group(1)}'. El alias debe coincidir con el nombre de la propiedad.",
+            )
+        if m_in_r and not m_in_a:
+            return ESLintFinding(
+                rule="@angular-eslint/no-input-rename", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description=f"Corrección: se elimina alias '{m_in_r.group(1)}' de @Input().",
+            )
+
+        # Regla 7 – no-inputs-metadata-property
+        if self._RE_INPUTS_META.search(a) and not self._RE_INPUTS_META.search(r):
+            return ESLintFinding(
+                rule="@angular-eslint/no-inputs-metadata-property", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="Propiedad 'inputs:' en decorador. Usar @Input() en cada campo.",
+            )
+        if self._RE_INPUTS_META.search(r) and not self._RE_INPUTS_META.search(a):
+            return ESLintFinding(
+                rule="@angular-eslint/no-inputs-metadata-property", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description="Corrección: se elimina propiedad 'inputs:' del decorador.",
+            )
+
+        # Regla 8 – no-output-native
+        m_out_decl = self._RE_OUTPUT_DECL.search(a)
+        if m_out_decl:
+            out_name = m_out_decl.group(1).strip()
+            if out_name.lower() in DOM_NATIVE_EVENTS:
+                return ESLintFinding(
+                    rule="@angular-eslint/no-output-native", severity="ERROR",
+                    category="VIOLACION", line_added=a, line_removed=r,
+                    description=f"@Output() '{out_name}' colisiona con evento DOM nativo.",
+                )
+
+        # Regla 9 – no-output-on-prefix
+        if self._RE_OUTPUT_ON.search(a) and not self._RE_OUTPUT_ON.search(r):
+            return ESLintFinding(
+                rule="@angular-eslint/no-output-on-prefix", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="@Output() cuyo nombre empieza por 'on'. Renombrar sin el prefijo.",
+            )
+        if self._RE_OUTPUT_ON.search(r) and not self._RE_OUTPUT_ON.search(a):
+            return ESLintFinding(
+                rule="@angular-eslint/no-output-on-prefix", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description="Corrección: se elimina prefijo 'on' del @Output().",
+            )
+
+        # Regla 10 – no-output-rename
+        m_out_a = self._RE_OUTPUT_ALIAS.search(a)
+        m_out_r = self._RE_OUTPUT_ALIAS.search(r) if r else None
+        if m_out_a and not m_out_r:
+            return ESLintFinding(
+                rule="@angular-eslint/no-output-rename", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description=f"@Output() con alias '{m_out_a.group(1)}'. El alias debe coincidir con el nombre de la propiedad.",
+            )
+        if m_out_r and not m_out_a:
+            return ESLintFinding(
+                rule="@angular-eslint/no-output-rename", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description=f"Corrección: se elimina alias '{m_out_r.group(1)}' de @Output().",
+            )
+
+        # Regla 11 – no-outputs-metadata-property
+        if self._RE_OUTPUTS_META.search(a) and not self._RE_OUTPUTS_META.search(r):
+            return ESLintFinding(
+                rule="@angular-eslint/no-outputs-metadata-property", severity="ERROR",
+                category="VIOLACION", line_added=a, line_removed=r,
+                description="Propiedad 'outputs:' en decorador. Usar @Output() en cada campo.",
+            )
+        if self._RE_OUTPUTS_META.search(r) and not self._RE_OUTPUTS_META.search(a):
+            return ESLintFinding(
+                rule="@angular-eslint/no-outputs-metadata-property", severity="ERROR",
+                category="CORRECCION", line_added=a, line_removed=r,
+                description="Corrección: se elimina propiedad 'outputs:' del decorador.",
+            )
+
+        # Regla 12 – use-lifecycle-interface
+        m_hook = self._RE_HOOK_METHOD.search(a)
+        if m_hook:
+            hook_name = m_hook.group(1)
+            if hook_name not in r:
+                iface = LIFECYCLE_INTERFACES.get(hook_name, "")
+                if iface:
+                    impl_match = self._RE_IMPLEMENTS.search(full_text)
+                    if not impl_match or iface not in impl_match.group(1):
+                        return ESLintFinding(
+                            rule="@angular-eslint/use-lifecycle-interface", severity="ERROR",
+                            category="VIOLACION", line_added=a, line_removed=r,
+                            description=f"Método '{hook_name}' sin declarar 'implements {iface}' en la clase.",
+                        )
+
+        # Regla 13 – use-pipe-transform-interface
+        if self._RE_PIPE_DECOR.search(a):
+            if not self._RE_PIPE_TRANSFORM.search(full_text):
+                return ESLintFinding(
+                    rule="@angular-eslint/use-pipe-transform-interface", severity="ERROR",
+                    category="VIOLACION", line_added=a, line_removed=r,
+                    description="Clase con @Pipe sin declarar 'implements PipeTransform'.",
+                )
+
+        # Reglas 1/3 – component-class-suffix / directive-class-suffix
+        m_cls = self._RE_CLASS_DEF.search(a)
+        if m_cls:
+            cls_name = m_cls.group(1)
+            is_comp = self._RE_COMP_DECOR.search(full_text)
+            is_dir  = self._RE_DIR_DECOR.search(full_text)
+            if is_comp and not cls_name.endswith('Component'):
+                return ESLintFinding(
+                    rule="@angular-eslint/component-class-suffix", severity="ERROR",
+                    category="VIOLACION", line_added=a, line_removed=r,
+                    description=f"La clase '{cls_name}' debe terminar en 'Component'.",
+                )
+            if is_dir and not cls_name.endswith('Directive'):
+                return ESLintFinding(
+                    rule="@angular-eslint/directive-class-suffix", severity="ERROR",
+                    category="VIOLACION", line_added=a, line_removed=r,
+                    description=f"La clase '{cls_name}' debe terminar en 'Directive'.",
+                )
+
+        # Reglas 14/15 – component-selector / directive-selector
+        m_sel = self._RE_SELECTOR.search(a)
+        if m_sel:
+            sel = m_sel.group(1).strip()
+            is_comp = bool(self._RE_COMP_DECOR.search(full_text))
+            is_dir  = bool(self._RE_DIR_DECOR.search(full_text))
+            if is_comp and not re.match(r'^app-[a-z][a-z0-9-]*$', sel):
+                return ESLintFinding(
+                    rule="@angular-eslint/component-selector", severity="ERROR",
+                    category="VIOLACION", line_added=a, line_removed=r,
+                    description=f"Selector de componente '{sel}' no cumple: prefijo 'app-', kebab-case, tipo elemento.",
+                )
+            if is_dir and not re.match(r'^app[A-Z][a-zA-Z0-9]*$', sel):
+                return ESLintFinding(
+                    rule="@angular-eslint/directive-selector", severity="ERROR",
+                    category="VIOLACION", line_added=a, line_removed=r,
+                    description=f"Selector de directiva '{sel}' no cumple: prefijo 'app', camelCase, tipo atributo.",
+                )
+
+        return None
+
+    # ── Análisis de archivo completo ─────────────────────────────────────────
+
+    def analyze_file(self, fc: FileChange) -> ESLintFileReport:
+        """
+        Analiza todas las líneas añadidas de un FileChange.
+        Empareja cada línea + con la línea - más similar del mismo hunk
+        para distinguir correcciones de violaciones nuevas.
+        """
+        report = ESLintFileReport()
+        ext = fc.ext.lower()
+        is_html = ext in ('.html', '.component.html')
+        is_ts   = ext in (
+            '.ts', '.component.ts', '.service.ts', '.pipe.ts',
+            '.directive.ts', '.guard.ts', '.interceptor.ts',
+            '.module.ts', '.resolver.ts',
+        )
+
+        if not (is_html or is_ts):
+            report.functional = [l for l in fc.added]
+            return report
+
+        removed_pool = list(fc.removed)
+        used_findings: Set[Tuple[str, str, str]] = set()
+
+        for added_l in fc.added:
+            a_stripped = added_l.strip()
+            paired_r   = self._best_removed_match(added_l, removed_pool)
+
+            finding: Optional[ESLintFinding] = None
+            if is_html:
+                finding = self.analyze_html_line(added_l, paired_r)
+            elif is_ts:
+                finding = self.analyze_ts_line(added_l, paired_r, fc.full_content)
+
+            if finding:
+                key = (finding.rule, finding.category, a_stripped[:120])
+                if key not in used_findings:
+                    used_findings.add(key)
+                    if finding.category == 'CORRECCION':
+                        report.corrections.append(finding)
+                    else:
+                        report.violations.append(finding)
+            else:
+                report.functional.append(a_stripped)
+
+        return report
+
+
 def analyze_technical_impact(fc: FileChange) -> str:
     """
     FIX BUG 5: Archivos de entorno analizan full_content para detectar
@@ -1333,11 +1821,12 @@ def _h1(doc, text: str):
 # =============================================================================
 class ReportGenerator:
     def __init__(self, changes: List[FileChange], branch_from: str, branch_to: str, output: str):
-        self.changes     = changes
-        self.branch_from = branch_from
-        self.branch_to   = branch_to
-        self.output      = output
-        self.doc         = Document()
+        self.changes         = changes
+        self.branch_from     = branch_from
+        self.branch_to       = branch_to
+        self.output          = output
+        self.doc             = Document()
+        self._eslint_reports: Dict[str, ESLintFileReport] = {}
         self._upgrade_compatibility()
         self._page_setup()
 
@@ -1583,9 +2072,89 @@ class ReportGenerator:
                 else:
                     _bullet(self.doc, line_display, "-", C_DEL_TEXT)
 
+    def _render_eslint_report(self, eslint_report: "ESLintFileReport", fc: "FileChange"):
+        """
+        Renderiza las tablas ESLint (correcciones, violaciones y cambios funcionales)
+        de un archivo Angular (.ts o .html) dentro del informe docx.
+        """
+        ext = fc.ext.lower()
+        is_html = ext in ('.html', '.component.html')
+        is_ts   = ext in (
+            '.ts', '.component.ts', '.service.ts', '.pipe.ts',
+            '.directive.ts', '.guard.ts', '.interceptor.ts',
+            '.module.ts', '.resolver.ts',
+        )
+        if not (is_html or is_ts):
+            return
+        if not eslint_report.corrections and not eslint_report.violations:
+            p_ok = self.doc.add_paragraph()
+            p_ok.paragraph_format.space_before = Pt(4)
+            _run(p_ok, "Análisis ESLint: ", bold=True, color=C_TITLE, size=9)
+            _run(p_ok, "No se detectaron correcciones ni violaciones ESLint en las líneas añadidas.",
+                 color=C_MUTED, size=9, italic=True)
+            return
+
+        # ── Correcciones ESLint ───────────────────────────────────────────────
+        if eslint_report.corrections:
+            p_corr = self.doc.add_paragraph()
+            p_corr.paragraph_format.space_before = Pt(6)
+            _run(p_corr, f"✔ Correcciones ESLint aplicadas ({len(eslint_report.corrections)})",
+                 bold=True, color=C_ADD_TEXT, size=10)
+
+            CORR_COLS = [
+                ("#",             0.5),
+                ("Antes (−)",     4.8),
+                ("Después (+)",   4.8),
+                ("Regla corregida", 3.4),
+                ("Severidad",     1.3),
+            ]
+            tbl_c = self.doc.add_table(rows=1, cols=len(CORR_COLS))
+            tbl_c.style = "Table Grid"
+            _header_row(tbl_c, CORR_COLS)
+
+            for idx, f in enumerate(eslint_report.corrections, 1):
+                before = (f.line_removed[:90] + "…") if len(f.line_removed) > 90 else f.line_removed
+                after  = (f.line_added[:90]   + "…") if len(f.line_added)   > 90 else f.line_added
+                _data_row(tbl_c, [
+                    (str(idx),    0.5,  C_MUTED,    False, C_WHITE),
+                    (before,      4.8,  C_DEL_TEXT, False, C_DEL_BG),
+                    (after,       4.8,  C_ADD_TEXT, False, C_ADD_BG),
+                    (f.rule,      3.4,  C_MOD_TEXT, False, C_ROW_ALT),
+                    (f.severity,  1.3,  C_ADD_TEXT, True,  C_ADD_BG),
+                ])
+            self.doc.add_paragraph()
+
+        # ── Violaciones ESLint ────────────────────────────────────────────────
+        if eslint_report.violations:
+            p_viol = self.doc.add_paragraph()
+            p_viol.paragraph_format.space_before = Pt(6)
+            _run(p_viol, f"✘ Violaciones ESLint introducidas ({len(eslint_report.violations)})",
+                 bold=True, color=C_DEL_TEXT, size=10)
+
+            VIOL_COLS = [
+                ("#",            0.5),
+                ("Línea añadida (+)", 6.0),
+                ("Regla violada",    5.5),
+                ("Severidad",        1.3),
+            ]
+            tbl_v = self.doc.add_table(rows=1, cols=len(VIOL_COLS))
+            tbl_v.style = "Table Grid"
+            _header_row(tbl_v, VIOL_COLS)
+
+            for idx, f in enumerate(eslint_report.violations, 1):
+                line_disp = (f.line_added[:110] + "…") if len(f.line_added) > 110 else f.line_added
+                _data_row(tbl_v, [
+                    (str(idx),    0.5,  C_MUTED,    False, C_WHITE),
+                    (line_disp,   6.0,  C_DEL_TEXT, False, C_DEL_BG),
+                    (f.rule,      5.5,  C_MOD_TEXT, False, C_ROW_ALT),
+                    (f.severity,  1.3,  C_DEL_TEXT, True,  C_DEL_BG),
+                ])
+            self.doc.add_paragraph()
+
     def _detail(self):
         semantic_engine = SemanticInsightEngine()
         relation_engine = ChangeRelationAnalyzer(self.changes)
+        eslint_analyzer  = ESLintAngularAnalyzer()
         _h1(self.doc, "2. Detalle de Cambios por Archivo")
 
         for i, fc in enumerate(self.changes):
@@ -1629,6 +2198,10 @@ class ReportGenerator:
                  color=C_MUTED, size=8)
             _run(p_stats, f"Impacto en deploy: {deploy_level}", bold=True, color=tc_dep, size=8)
 
+            # ── Análisis ESLint (antes del renderizado de líneas) ──────────────
+            eslint_report = eslint_analyzer.analyze_file(fc)
+            self._eslint_reports[fc.filepath] = eslint_report
+
             # Elegir estrategia de renderizado
             if fc.is_binary:
                 _bullet(self.doc, "Archivo binario. No se puede mostrar contenido de texto.",
@@ -1639,6 +2212,9 @@ class ReportGenerator:
                 self._render_structural_summary(fc)
             else:
                 self._render_line_detail(fc)
+
+            # ── Reporte ESLint (correcciones / violaciones) ─────────────────────
+            self._render_eslint_report(eslint_report, fc)
 
             if not fc.added and not fc.removed and not fc.is_binary:
                 p_empty = self.doc.add_paragraph()
@@ -1700,6 +2276,85 @@ class ReportGenerator:
             _bullet(self.doc, rec, " > ", C_MOD_TEXT)
         self.doc.add_paragraph()
 
+    def _eslint_global_summary(self):
+        """Sección 5: Resumen global del análisis ESLint para todo el diff."""
+        if not self._eslint_reports:
+            return
+
+        all_corrections: List[ESLintFinding] = []
+        all_violations:  List[ESLintFinding] = []
+        for report in self._eslint_reports.values():
+            all_corrections.extend(report.corrections)
+            all_violations.extend(report.violations)
+
+        # Contar frecuencia por regla
+        from collections import Counter
+        corr_counter = Counter(f.rule for f in all_corrections)
+        viol_counter = Counter(f.rule for f in all_violations)
+
+        _h1(self.doc, "5. Resumen Global del Análisis ESLint")
+
+        # Estadísticas generales
+        ts_files   = sum(1 for fc in self.changes
+                         if fc.ext.lower() in ('.ts', '.component.ts', '.service.ts',
+                                               '.pipe.ts', '.directive.ts', '.guard.ts',
+                                               '.interceptor.ts', '.module.ts', '.resolver.ts'))
+        html_files = sum(1 for fc in self.changes
+                         if fc.ext.lower() in ('.html', '.component.html'))
+
+        p_stat = self.doc.add_paragraph()
+        p_stat.paragraph_format.space_after = Pt(6)
+        _run(p_stat,
+             f"Archivos TypeScript analizados: {ts_files}   "
+             f"Archivos HTML analizados: {html_files}   "
+             f"Correcciones ESLint: {len(all_corrections)}   "
+             f"Violaciones ESLint: {len(all_violations)}",
+             color=C_MUTED, size=9, italic=True)
+
+        # ── Tabla de correcciones por regla ───────────────────────────────────
+        if corr_counter:
+            p_c = self.doc.add_paragraph()
+            _run(p_c, "Reglas más frecuentemente corregidas:", bold=True,
+                 color=C_ADD_TEXT, size=10)
+            COLS_C = [("#", 0.5), ("Regla ESLint", 8.5), ("Veces corregida", 2.2), ("Severidad", 1.5)]
+            tbl_c = self.doc.add_table(rows=1, cols=len(COLS_C))
+            tbl_c.style = "Table Grid"
+            _header_row(tbl_c, COLS_C)
+            for rank, (rule, count) in enumerate(corr_counter.most_common(10), 1):
+                _data_row(tbl_c, [
+                    (str(rank), 0.5,  C_MUTED,    False, C_WHITE),
+                    (rule,      8.5,  C_MOD_TEXT, False, C_ROW_ALT),
+                    (str(count),2.2,  C_ADD_TEXT, True,  C_ADD_BG),
+                    ("ERROR",   1.5,  C_ADD_TEXT, True,  C_ADD_BG),
+                ])
+            self.doc.add_paragraph()
+
+        # ── Tabla de violaciones por regla ────────────────────────────────────
+        if viol_counter:
+            p_v = self.doc.add_paragraph()
+            _run(p_v, "Reglas con violaciones introducidas:", bold=True,
+                 color=C_DEL_TEXT, size=10)
+            COLS_V = [("#", 0.5), ("Regla ESLint", 8.5), ("Ocurrencias", 2.2), ("Severidad", 1.5)]
+            tbl_v = self.doc.add_table(rows=1, cols=len(COLS_V))
+            tbl_v.style = "Table Grid"
+            _header_row(tbl_v, COLS_V)
+            for rank, (rule, count) in enumerate(viol_counter.most_common(10), 1):
+                _data_row(tbl_v, [
+                    (str(rank), 0.5,  C_MUTED,    False, C_WHITE),
+                    (rule,      8.5,  C_MOD_TEXT, False, C_ROW_ALT),
+                    (str(count),2.2,  C_DEL_TEXT, True,  C_DEL_BG),
+                    ("ERROR",   1.5,  C_DEL_TEXT, True,  C_DEL_BG),
+                ])
+            self.doc.add_paragraph()
+
+        if not all_corrections and not all_violations:
+            p_ok = self.doc.add_paragraph()
+            _run(p_ok,
+                 "No se detectaron correcciones ni violaciones ESLint en ningún archivo "
+                 "TypeScript o HTML del diff.",
+                 color=C_MUTED, size=9, italic=True)
+            self.doc.add_paragraph()
+
     def _footer(self):
         _divider(self.doc)
         p = self.doc.add_paragraph()
@@ -1722,6 +2377,7 @@ class ReportGenerator:
         self._detail()
         self._impact_legend()
         self._recommendations()
+        self._eslint_global_summary()
         self._footer()
         self.doc.save(self.output)
         return self.output
