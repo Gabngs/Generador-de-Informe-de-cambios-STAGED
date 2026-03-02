@@ -130,18 +130,53 @@ class FileChange:
     @property
     def is_lockfile(self) -> bool:
         """Detecta archivos de lock/dependencias que no aportan valor en detalle linea a linea."""
-        return self.filename.lower() in (
+        name = self.filename.lower()
+        # Sufijo .bak: siempre es copia de respaldo, sin valor linea a linea
+        if name.endswith('.bak'):
+            return True
+        return name in (
             'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
             'composer.lock', 'gemfile.lock', 'poetry.lock', 'cargo.lock',
-            'packages.lock.json', 'shrinkwrap.json'
+            'packages.lock.json', 'shrinkwrap.json',
+            # .NET / NuGet
+            'packages.config',
+            # Go
+            'go.sum',
+            # Python
+            'pipfile.lock',
+            # Elixir
+            'mix.lock',
+            # Flutter / Dart
+            'pubspec.lock',
+            # Nix
+            'flake.lock',
+            # Swift
+            'package.resolved',
         )
 
     @property
     def is_environment_file(self) -> bool:
         """Detecta archivos de entorno/configuracion de ambiente."""
         name = self.filename.lower()
-        return (name.startswith('environment') and name.endswith('.ts')) or \
-               name in ('.env', '.env.local', '.env.production', '.env.staging', '.env.qa')
+        # Angular environments
+        if name.startswith('environment') and name.endswith('.ts'):
+            return True
+        # ASP.NET Core appsettings
+        if name.startswith('appsettings') and name.endswith('.json'):
+            return True
+        # Spring Boot
+        if name.startswith('application') and name.endswith(('.properties', '.yml', '.yaml')):
+            return True
+        return name in (
+            '.env', '.env.local', '.env.production', '.env.staging', '.env.qa',
+            '.env.example',
+            # .NET Framework
+            'web.config', 'app.config',
+            # Django / Flask
+            'settings.py',
+            # Rails
+            'database.yml',
+        )
 
     @property
     def needs_structural_summary(self) -> bool:
@@ -167,6 +202,18 @@ class FileChange:
         # Archivos con interfaces/tipos exportados (aunque sean pequenos)
         all_text = "\n".join(self.added)
         if re.search(r'export\s+(interface|type|enum|class)\b', all_text) and len(self.added) > 10:
+            return True
+
+        # Archivos de respaldo: siempre resumen (son copias completas)
+        if self.ext == '.bak':
+            return True
+
+        # Soluciones y proyectos de Visual Studio: siempre resumen
+        if self.ext in ('.sln', '.vbproj', '.csproj', '.vcxproj', '.fsproj'):
+            return True
+
+        # Archivos de recursos / XML / config grandes
+        if self.ext in ('.resx', '.xml', '.config', '.manifest') and total > 20:
             return True
 
         return False
@@ -210,7 +257,19 @@ class FileChange:
         import_pattern    = re.compile(r'^\s*(import|from|require\(|include|using)\b')
         entity_pattern    = re.compile(
             r'^\s*(export )?(class|def|function|interface|const \w+\s*=\s*\(|'
-            r'let \w+\s*=\s*\(|async function|type\s+\w+\s*=|enum\s+\w+)'
+            r'let \w+\s*=\s*\(|async function|type\s+\w+\s*=|enum\s+\w+|'
+            # VB.NET
+            r'(?:Public|Private|Protected|Friend)\s+(?:Class|Module|Sub|Function|Property|Enum|Interface|Structure)\s+|'
+            r'Public\s+(?:Shared\s+)?(?:ReadOnly\s+)?(?:Sub|Function)\s+|'
+            # C# / .NET
+            r'(?:public|private|protected|internal|static|override|virtual|abstract)\s+(?:class|interface|record|struct|enum|void|async\s+Task)\s+|'
+            r'(?:public|private|protected)\s+\w+\s+\w+\s*(?:\(|{)|'
+            # Go
+            r'func\s+(?:\([^)]*\)\s*)?\w+|'
+            # Rust
+            r'(?:pub\s+)?(?:fn|struct|enum|trait|impl)\s+\w+|'
+            # Java / Kotlin
+            r'(?:public|private|protected)\s+(?:static\s+)?(?:class|interface|enum|\w+)\s+\w+)'
         )
         decorator_pattern = re.compile(r'^\s*@\w+')
         route_pattern     = re.compile(
@@ -318,6 +377,60 @@ class FileChange:
                 summary.append(f"Se incorporan/ajustan estructuras lógicas: {ents}.")
             if struct["imports"]:
                 summary.append("Se actualizan dependencias para soportar la nueva lógica del archivo.")
+
+        elif self.ext in ('.vb',):
+            all_text = "\n".join(self.added + self.removed)
+            if struct["entities"]:
+                ents = ", ".join(struct["entities"][:5])
+                summary.append(f"Se incorporan/modifican rutinas VB.NET: {ents}.")
+            if re.search(r'\bSub\s+New\b|\bSub\s+Form_Load\b', all_text, re.I):
+                summary.append("Se ajusta la inicialización del formulario.")
+            if re.search(r"'\s*(Private|Public)\s+(Sub|Function)", all_text):
+                summary.append("Se comenta o elimina código de eventos/funciones previamente activo.")
+            if re.search(r'EsCajaApp|Obtener_Caja_App|EstamosEnCajaPrincipal', all_text):
+                summary.append("Se introduce lógica de tipo CajaApp para bypass condicional de reglas de caja.")
+            if re.search(r'\bRealizarConsulta\b|\bDataTable\b|\bDataRow\b', all_text):
+                summary.append("Se aplican cambios en acceso a datos (consultas o manejo de DataTable/DataRow).")
+
+        elif self.ext in ('.cs',):
+            all_text = "\n".join(self.added + self.removed)
+            if struct["entities"]:
+                ents = ", ".join(struct["entities"][:5])
+                summary.append(f"Se incorporan/modifican clases o métodos C#: {ents}.")
+            if re.search(r'\[HttpGet\]|\[HttpPost\]|\[HttpPut\]|\[HttpDelete\]|\[Route\(', all_text):
+                summary.append("Se ajustan endpoints de API REST (atributos de enrutamiento HTTP).")
+            if re.search(r'DbContext|SaveChangesAsync|AddDbContext', all_text):
+                summary.append("Se modifica la interacción con base de datos mediante Entity Framework.")
+
+        elif self.ext in ('.sln',):
+            summary.append("Se modifica la solución Visual Studio: cambio de versión, proyectos referenciados o configuración de build.")
+
+        elif self.ext in ('.bak',):
+            summary.append("Archivo de respaldo generado automáticamente por el IDE. Refleja el estado previo antes de la modificación del archivo original.")
+            summary.append(f"Contiene {len(self.added)} líneas del snapshot anterior.")
+
+        elif self.ext in ('.java', '.kt'):
+            all_text = "\n".join(self.added + self.removed)
+            if struct["entities"]:
+                ents = ", ".join(struct["entities"][:5])
+                summary.append(f"Se incorporan/modifican clases o métodos: {ents}.")
+            if re.search(r'@RestController|@Controller|@Service|@Repository', all_text):
+                summary.append("Se ajustan componentes de la capa Spring (Controller/Service/Repository).")
+            if re.search(r'@GetMapping|@PostMapping|@PutMapping|@DeleteMapping', all_text):
+                summary.append("Se modifican endpoints REST de Spring MVC.")
+
+        elif self.ext in ('.go',):
+            all_text = "\n".join(self.added + self.removed)
+            if struct["entities"]:
+                ents = ", ".join(struct["entities"][:5])
+                summary.append(f"Se incorporan/modifican funciones Go: {ents}.")
+            if re.search(r'\bhttp\.HandleFunc\b|\bgin\.\w+\b|\becho\.\w+\b', all_text):
+                summary.append("Se ajustan handlers de rutas HTTP en Go.")
+
+        elif self.ext in ('.rs',):
+            if struct["entities"]:
+                ents = ", ".join(struct["entities"][:5])
+                summary.append(f"Se incorporan/modifican estructuras Rust: {ents}.")
 
         if not summary:
             if self.kind == 'added':
@@ -456,6 +569,27 @@ class FileChange:
             if '=>' in r_line and re.sub(r'\((\w+)\)\s*=>', r'\1 =>', r_line) == a_line:
                 return "Prettier: Eliminar parentesis en arrow function de un parametro"
 
+            # 14. VB.NET: correccion de casing de identificador (gd_Fproceso -> gd_fproceso)
+            # SOLO en .vb: en otros lenguajes los cambios de casing tienen otra semántica
+            if self.ext == '.vb' and r_line.lower() == a_line.lower() and r_line != a_line and not r_line.startswith("'"):
+                return "Linter VB.NET: Correccion de casing de identificador"
+
+            # 15. VB.NET / .NET: correccion de tipo estatico (file. -> File.)
+            # SOLO en .vb/.cs: en Python/Go file. es un objeto valido que no debe reescribirse
+            if self.ext in ('.vb', '.cs') and (
+                re.sub(r'\bfile\.', 'File.', r_line) == a_line
+                or re.sub(r'\bFile\.', 'file.', r_line) == a_line
+            ):
+                return "Linter .NET: Correccion de casing de tipo estatico (File/file)"
+
+            # 16. VB.NET: redundancia booleana (= True / = False)
+            # SOLO en .vb: Python tambien usa = True pero con semántica diferente (no es redundancia)
+            if self.ext == '.vb':
+                r_notrue = re.sub(r'\s*=\s*True\b', '', r_line)
+                a_notrue = re.sub(r'\s*=\s*True\b', '', a_line)
+                if r_notrue == a_notrue and r_notrue != r_line:
+                    return "Linter VB.NET: Comparacion booleana redundante (= True eliminado)"
+
         return ""
 
     def classify_removed_line(self, line: str) -> str:
@@ -470,8 +604,24 @@ class FileChange:
         if stripped.startswith('//') or stripped.startswith('#') \
                 or stripped.startswith('*') or stripped.startswith('/*'):
             return "[Doc] Comentario o documentacion eliminada"
+        # VB.NET: comentario con apostrofe — SOLO para archivos .vb
+        # (en PHP/Ruby/SQL la comilla simple tiene otros usos: strings, claves de array, etc.)
+        if self.ext == '.vb' and stripped.startswith("'"):
+            if re.search(r"'\s*(Private|Public|Protected|Friend)\s+(Sub|Function|Class)", stripped):
+                return "[Refactor] Codigo VB.NET comentado eliminado (evento/rutina)"
+            return "[Doc] Comentario VB.NET eliminado"
+        # SQL: comentario de doble guion
+        # EXCLUIR CSS/SCSS: las custom properties empiezan con -- (--primary-color: #fff)
+        if stripped.startswith('--') and self.ext not in ('.css', '.scss', '.component.scss', '.sass', '.less'):
+            return "[Doc] Comentario SQL eliminado"
+        # VB.NET legacy: REM — SOLO para archivos .vb
+        if self.ext == '.vb' and stripped.upper().startswith('REM '):
+            return "[Doc] Comentario legado VB (REM) eliminado"
         if re.match(r'(console\.(log|warn|error|debug|info)|print\(|logger\.|Log\.)', stripped):
             return "[Debug] Traza o log de depuracion eliminada"
+        # VB.NET debug: MsgBox / Debug.Print
+        if re.match(r'(MsgBox\(|Debug\.Print\b|MessageBox\.Show\()', stripped):
+            return "[Debug] Cuadro de dialogo o traza de depuracion VB.NET eliminada"
         if re.search(r'\b(TODO|FIXME|HACK|XXX|TEMP)\b', stripped, re.I):
             return "[Deuda tecnica] Comentario TODO/FIXME eliminado"
         if re.search(r'\b(isDevMode|environment\.|process\.env|DEBUG|FEATURE_FLAG)\b', stripped, re.I):
@@ -602,6 +752,50 @@ FILE_CATEGORIES: Dict[str, str] = {
     # PHP / Laravel
     '.php':             'PHP Backend',
     '.blade.php':       'Vista Blade PHP',
+    # VB.NET / Visual Studio
+    '.vb':              'Formulario / Clase VB.NET',
+    '.vbproj':          'Proyecto VB.NET',
+    '.sln':             'Solucion Visual Studio',
+    '.bak':             'Archivo de Respaldo',
+    # C# / .NET
+    '.cs':              'Clase C#',
+    '.csproj':          'Proyecto C#',
+    '.razor':           'Componente Blazor',
+    '.cshtml':          'Vista Razor MVC',
+    '.resx':            'Recursos .NET',
+    '.xaml':            'Interfaz XAML',
+    '.config':          'Configuracion App (.NET)',
+    # Java / Kotlin
+    '.java':            'Clase Java',
+    '.kt':              'Clase Kotlin',
+    # Go / Rust / Ruby
+    '.go':              'Archivo Go',
+    '.rs':              'Archivo Rust',
+    '.rb':              'Clase Ruby',
+    # Frontend
+    '.vue':             'Componente Vue',
+    '.jsx':             'Componente React JSX',
+    '.tsx':             'Componente React TSX',
+    '.svelte':          'Componente Svelte',
+    # Mobile
+    '.dart':            'Clase Dart/Flutter',
+    '.swift':           'Codigo Swift',
+    # C / C++
+    '.cpp':             'Clase C++',
+    '.cc':              'Clase C++',
+    '.h':               'Header C/C++',
+    '.hpp':             'Header C++',
+    # Infraestructura
+    '.tf':              'Infraestructura Terraform',
+    '.dockerfile':      'Dockerfile',
+    # Otros
+    '.toml':            'Configuracion TOML',
+    '.ini':             'Configuracion INI',
+    '.proto':           'Definicion gRPC',
+    '.r':               'Script R',
+    '.ipynb':           'Notebook Jupyter',
+    '.editorconfig':    'Configuracion Editor',
+    '.gitignore':       'Git Ignore',
 }
 
 def get_category(fc: FileChange) -> str:
@@ -679,6 +873,63 @@ IMPACT_SIGNALS: List[Tuple[re.Pattern, str]] = [
      'Trazabilidad / respuesta estandarizada de API PHP'),
     (re.compile(r'->paginate\s*\(|->get\s*\(|->first\s*\(|->count\s*\(', re.I),
      'Consulta de coleccion Eloquent'),
+    # --- VB.NET / Windows Forms ---
+    (re.compile(r'\bRealizarConsulta\s*\(|\bEjecutarSP\s*\(|\bCALL\s+usp_', re.I),
+     'Llamada a procedimiento almacenado VB.NET'),
+    (re.compile(r'\bDataTable\b|\bDataRow\b|\bDataSet\b|\bDataAdapter\b'),
+     'Manejo de datos (DataTable/DataRow) VB.NET'),
+    (re.compile(r'\bMsgBox\s*\(|\bMessageBox\.Show\s*\(', re.I),
+     'Cuadro de dialogo (MsgBox) VB.NET'),
+    (re.compile(r'\bTry\b[\s\S]*?\bCatch\s+ex\s+As\s+Exception\b', re.I),
+     'Gestion de errores Try/Catch VB.NET'),
+    (re.compile(r'\.ShowDialog\s*\(|\.Show\s*\(|Me\.Close\s*\(|Me\.Dispose\s*\(', re.I),
+     'Control de ciclo de vida de formulario VB.NET'),
+    (re.compile(r'\bEsCajaApp\b|\bObtener_Caja_App\b|\bEstamosEnCajaPrincipal\b', re.I),
+     'Logica de tipo CajaApp (bypass de reglas de caja)'),
+    (re.compile(r'\bfValidacionPrincipal\s*\(|\bfValidacionTurnos\s*\(', re.I),
+     'Validacion de caja principal o turnos VB.NET'),
+    (re.compile(r'\bbalancin\b', re.I),
+     'Verificacion de balancin (caja)'),
+    # --- C# / ASP.NET ---
+    (re.compile(r'\[HttpGet\]|\[HttpPost\]|\[HttpPut\]|\[HttpDelete\]|\[Route\('),
+     'Endpoint de API REST ASP.NET'),
+    (re.compile(r'\[Authorize\]|\[AllowAnonymous\]'),
+     'Control de autorizacion ASP.NET'),
+    (re.compile(r'\bDbContext\b|SaveChangesAsync|AddDbContext\b'),
+     'Acceso a base de datos Entity Framework'),
+    (re.compile(r'\bILogger\b|_logger\.Log|_logger\.Error|_logger\.Info', re.I),
+     'Trazabilidad con ILogger .NET'),
+    # --- Solucion Visual Studio (.sln) ---
+    (re.compile(r'VisualStudioVersion\s*='),
+     'Version de Visual Studio en solucion'),
+    (re.compile(r'Project\s*\(', re.I),
+     'Proyecto referenciado en solucion .sln'),
+    # --- Java / Spring ---
+    (re.compile(r'@RestController|@Controller|@Service|@Repository|@Component'),
+     'Componente de capa Spring (Controller/Service/Repository)'),
+    (re.compile(r'@GetMapping|@PostMapping|@PutMapping|@DeleteMapping|@RequestMapping'),
+     'Endpoint REST Spring MVC'),
+    (re.compile(r'@Transactional|@Rollback|EntityManager\b', re.I),
+     'Transaccion JPA/Hibernate'),
+    (re.compile(r'@Autowired|@Inject\b|@Bean\b'),
+     'Inyeccion de dependencias Spring'),
+    # --- Python / Django / Flask ---
+    (re.compile(r'urlpatterns\s*=|path\s*\(|include\s*\(', re.I),
+     'Definicion de rutas Django/Flask'),
+    (re.compile(r'models\.Model|models\.CharField|models\.IntegerField', re.I),
+     'Modelo Django'),
+    (re.compile(r'@app\.route|@blueprint\.route', re.I),
+     'Endpoint Flask'),
+    (re.compile(r'\.delay\s*\(|celery\.task|@shared_task', re.I),
+     'Tarea asincrona Celery'),
+    # --- Go ---
+    (re.compile(r'\bhttp\.HandleFunc\b|\bgin\.Default\b|\becho\.New\b'),
+     'Handler HTTP Go (net/http / Gin / Echo)'),
+    (re.compile(r'\bsql\.Open\b|\bdb\.Exec\b|\bdb\.Query\b'),
+     'Acceso a base de datos Go'),
+    # --- Rust ---
+    (re.compile(r'\bactix_web\b|\bwarp::|\.route\s*\(|\baxum::', re.I),
+     'Handler HTTP Rust (Actix/Warp/Axum)'),
 ]
 # =============================================================================
 # MOTOR DE ANALISIS SEMANTICO CONTEXTUAL
@@ -786,6 +1037,81 @@ class SemanticInsightEngine:
         if re.search(r'\bthis\.', removed) and not re.search(r'\bthis\.', added):
             insights.append(
                 "Se reduce uso de propiedades del componente, indicando simplificación del estado."
+            )
+
+        # ---------------------------------------------------------
+        # 11. VB.NET: eventos comentados (posible desactivación temporal)
+        # ---------------------------------------------------------
+        if fc.ext == '.vb':
+            commented_events = re.findall(
+                r"'\s*(?:Private|Public)\s+Sub\s+(\w+)\s*\(", removed
+            )
+            if commented_events:
+                evs = ", ".join(commented_events[:4])
+                insights.append(
+                    f"Se comentan manejadores de eventos VB.NET ({evs}), "
+                    "posible desactivación temporal de funcionalidades interactivas."
+                )
+
+        # ---------------------------------------------------------
+        # 12. VB.NET: parametrización de función (eliminación de global)
+        # ---------------------------------------------------------
+        if fc.ext == '.vb':
+            if re.search(r'\b(idCaja|idUsuario|idTerminal)\b', added) and \
+               not re.search(r'\b(idCaja|idUsuario|idTerminal)\b', removed):
+                insights.append(
+                    "Se parametrizan funciones VB.NET que antes usaban variables globales, "
+                    "mejorando la reutilización y testabilidad del código."
+                )
+
+        # ---------------------------------------------------------
+        # 13. VB.NET / .NET: corrección de casing de tipo estático
+        # ---------------------------------------------------------
+        if fc.ext in ('.vb', '.cs'):
+            if re.search(r'\bfile\.', removed) and re.search(r'\bFile\.', added):
+                insights.append(
+                    "Se corrige casing de tipo estático .NET (file. → File.), "
+                    "alineando con convenciones BCL de .NET Framework."
+                )
+
+        # ---------------------------------------------------------
+        # 14. Archivo de respaldo (.bak): sin valor funcional
+        # ---------------------------------------------------------
+        if fc.ext == '.bak':
+            insights.append(
+                "Archivo de respaldo automático (IDE). No representa lógica nueva; "
+                "contiene snapshot del estado anterior del archivo original."
+            )
+
+        # ---------------------------------------------------------
+        # 15. Solución Visual Studio (.sln): cambio de scope del proyecto
+        # ---------------------------------------------------------
+        if fc.ext == '.sln':
+            if re.search(r'VisualStudioVersion', full):
+                insights.append(
+                    "Se actualiza la versión del entorno de desarrollo en el archivo de solución, "
+                    "lo que puede requerir que todos los colaboradores actualicen su Visual Studio."
+                )
+            removed_projects = len(re.findall(r'^-.*Project\s*\(', removed, re.M))
+            added_projects   = len(re.findall(r'^\+?.*Project\s*\(', added,   re.M))
+            if removed_projects > added_projects:
+                insights.append(
+                    f"Se eliminan {removed_projects - added_projects} proyecto(s) de la solución, "
+                    "reduciendo el scope del build y la solución."
+                )
+            elif added_projects > removed_projects:
+                insights.append(
+                    f"Se incorporan {added_projects - removed_projects} proyecto(s) nuevo(s) a la solución."
+                )
+
+        # ---------------------------------------------------------
+        # 16. Lógica de bypass condicional (CajaApp / feature flag)
+        # ---------------------------------------------------------
+        if re.search(r'\bEsCajaApp\b|\bObtener_Caja_App\b|\bEstamosEnCajaPrincipal\b', full, re.I):
+            insights.append(
+                "Se introduce bifurcación condicional basada en tipo de caja (CajaApp), "
+                "permitiendo que ciertos registros omitan restricciones de IP y balance. "
+                "Patrón equivalente a feature-flag a nivel de entidad."
             )
 
         return insights
