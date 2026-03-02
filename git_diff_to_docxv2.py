@@ -1706,7 +1706,7 @@ def analyze_recommendations(changes: List[FileChange]) -> List[str]:
     if any(calculate_deploy_impact(f) in ("Alta", "Critica") for f in changes):
         recs.append(
             "Existen cambios de impacto ALTO o CRITICO. Se recomienda "
-            "revision por pares (code review) antes del merge a develop."
+            "revision por pares (code review) antes del merge a desarrollo."
         )
 
     if not recs:
@@ -2428,7 +2428,7 @@ def main():
     ap.add_argument("--input",       "-i",  default=None,       help=f"Archivo diff (default: {DEFAULT_INPUT})")
     ap.add_argument("--output",      "-o",  default=None,       help=f"Archivo salida (default: {DEFAULT_OUTPUT})")
     ap.add_argument("--branch-from", "-bf", default="gabotest", help="Rama origen  (default: gabotest)")
-    ap.add_argument("--branch-to",   "-bt", default="develop",  help="Rama destino (default: develop)")
+    ap.add_argument("--branch-to",   "-bt", default="desarrollo",  help="Rama destino (default: desarrollo)")
     args = ap.parse_args()
 
     input_path = find_input(args.input)
