@@ -1,12 +1,33 @@
 #!/usr/bin/env python3
 """
-git_diff_to_docx.py
-────────────────────
+git_diff_to_docx.py  v4
+────────────────────────
 Lee 'informe.txt' (en la misma carpeta) generado con:
     git --no-pager diff --staged -U9999 > informe.txt
 
 Genera un informe profesional .docx analizando la lógica
 de los cambios, resumiendo archivos nuevos y detectando impacto.
+
+MEJORAS v4 (motores de análisis):
+  • Motor infer_modification_purpose: deduce el PROPÓSITO de alto nivel de
+    cada cambio (corrección de bug, refactor, nueva funcionalidad, limpieza,
+    cambio de contrato, optimización, seguridad, i18n, estilo/linter).
+  • build_functional_summary: ahora encabeza cada resumen con el propósito
+    inferido (ícono 🎯) antes de los detalles estructurales.
+  • analyze_php_logic_changes: incorpora propósito al inicio del bloque PHP.
+  • SemanticInsightEngine: 10 nuevos análisis (17-26):
+      17. Migración callback → async/await (TS).
+      18. Extracción de métodos / SRP (TS).
+      19. Refuerzo de tipado any → tipo concreto (TS).
+      20. Cambio de tipo de JOIN en SQL.
+      21. Gestión de efectos secundarios React/Vue (useEffect/watch).
+      22. Renombrado semántico de identificador.
+      23. Introducción / eliminación de try/catch.
+      24. Hardcoded → constante/variable configurable.
+      25. Eliminación de código comentado (deuda técnica).
+      26. Píxeles → unidades relativas CSS (accesibilidad).
+  • classify_removed_line: añade motivo explicativo a cada categoría
+    (por qué se eliminó, qué riesgo evita, qué mejora aporta).
 """
 
 import sys
@@ -337,11 +358,17 @@ class FileChange:
         return structure
 
     def build_functional_summary(self) -> List[str]:
-        """Genera una síntesis ejecutiva del cambio por archivo (sin detalle línea a línea)."""
+        """Genera una síntesis ejecutiva del cambio por archivo (sin detalle línea a línea).
+        Incluye inferencia del propósito del cambio al inicio."""
         summary: List[str] = []
         n_add = len(self.added)
         n_del = len(self.removed)
         struct = self.extract_structure()
+
+        # Propósito general inferido al inicio del resumen
+        purpose = infer_modification_purpose(self.added, self.removed, self.ext)
+        if purpose:
+            summary.append(f"🎯 {purpose}")
 
         if self.ext in ('.html', '.component.html'):
             if self.kind == 'added':
@@ -601,12 +628,30 @@ class FileChange:
         return ""
 
     def classify_removed_line(self, line: str) -> str:
-        """Clasifica la razon de eliminacion con mayor precision."""
+        """Clasifica la razon de eliminacion con mayor precision y explica el propósito."""
         linter = self.detect_linter_fix(line)
         if linter:
-            return f"[Linter] {linter}"
+            # Añadir contexto del propósito del fix de linter
+            rule_purpose = {
+                "ESLint: Igualdad estricta": "para evitar comparaciones implícitas que pueden dar falsos positivos con tipos distintos",
+                "ESLint: Usar const":        "para prevenir reasignaciones accidentales de variables que no deben cambiar",
+                "ESLint: Usar let":          "para reemplazar 'var' con alcance de bloque más predecible",
+                "Prettier: Cambio a comillas": "para unificar el estilo de cadenas en el proyecto",
+                "Prettier: Arreglo de espaciado": "para mantener consistencia de formato legible",
+                "ESLint: Trailing comma":    "para simplificar los diffs de git en cambios futuros",
+                "TSLint: Reemplazar 'any'":  "para mejorar la seguridad de tipos y detectar errores en compilación",
+                "ESLint: Eliminar console":  "para que no queden trazas de depuración en producción",
+                "ESLint: Convertir a arrow": "para usar la sintaxis moderna y capturar correctamente el contexto 'this'",
+                "ESLint: Object shorthand":  "para reducir redundancia en literales de objeto",
+            }
+            extra = ""
+            for key, reason in rule_purpose.items():
+                if key in linter:
+                    extra = f" — {reason}"
+                    break
+            return f"[Linter] {linter}{extra}"
         if self.verify_dead_code(line):
-            return "[Limpieza] Codigo sin uso detectado"
+            return "[Limpieza] Codigo sin uso detectado — se elimina para reducir deuda técnica y evitar confusión"
 
         stripped = line.strip()
         if stripped.startswith('//') or stripped.startswith('#') \
@@ -626,19 +671,147 @@ class FileChange:
         if self.ext == '.vb' and stripped.upper().startswith('REM '):
             return "[Doc] Comentario legado VB (REM) eliminado"
         if re.match(r'(console\.(log|warn|error|debug|info)|print\(|logger\.|Log\.)', stripped):
-            return "[Debug] Traza o log de depuracion eliminada"
+            return "[Debug] Traza o log de depuracion eliminada — evita exposición de información en producción"
         # VB.NET debug: MsgBox / Debug.Print
         if re.match(r'(MsgBox\(|Debug\.Print\b|MessageBox\.Show\()', stripped):
             return "[Debug] Cuadro de dialogo o traza de depuracion VB.NET eliminada"
         if re.search(r'\b(TODO|FIXME|HACK|XXX|TEMP)\b', stripped, re.I):
-            return "[Deuda tecnica] Comentario TODO/FIXME eliminado"
+            return "[Deuda tecnica] Comentario TODO/FIXME eliminado — saldando deuda técnica pendiente"
         if re.search(r'\b(isDevMode|environment\.|process\.env|DEBUG|FEATURE_FLAG)\b', stripped, re.I):
-            return "[Config] Flag de entorno o feature flag"
+            return "[Config] Flag de entorno o feature flag — posible limpieza de lógica de desarrollo"
         if stripped.startswith('//') and re.search(r'[({;=]', stripped):
-            return "[Refactor] Codigo comentado eliminado"
+            return "[Refactor] Codigo comentado eliminado — limpieza de código inactivo"
         if re.search(r'\b(mock|stub|fake|dummy|hardcoded|temp|test_data)\b', stripped, re.I):
-            return "[Test] Dato de prueba o mock eliminado"
+            return "[Test] Dato de prueba o mock eliminado — no debe llegar a producción"
         return ""
+
+
+# =============================================================================
+# MOTOR DE INFERENCIA DE PROPÓSITO  (compartido por todos los motores)
+# =============================================================================
+
+def infer_modification_purpose(
+    added: List[str],
+    removed: List[str],
+    ext: str = "",
+) -> Optional[str]:
+    """
+    Deduce el MOTIVO / PROPÓSITO de alto nivel de un cambio comparando
+    líneas añadidas y eliminadas, independientemente del lenguaje.
+
+    Devuelve una frase en español que explica para qué se hizo la modificación,
+    o None si no se puede inferir con suficiente confianza.
+
+    Estrategia:
+      - Compara la INTENCIÓN semántica del bloque eliminado vs el añadido.
+      - Usa señales léxicas y estructurales para identificar el patrón.
+      - Prioriza explicaciones de negocio sobre explicaciones técnicas.
+    """
+    added_text   = "\n".join(added)
+    removed_text = "\n".join(removed)
+
+    if not added_text.strip() and not removed_text.strip():
+        return None
+
+    # ── Patrón: corrección de bug / error ──────────────────────────────────
+    bug_fix_signals_rem = [
+        r'\bnull\b', r'undefined', r'TypeError', r'NullPointerException',
+        r'NullReferenceException', r'Uncaught', r'Exception', r'error\b',
+    ]
+    bug_fix_signals_add = [
+        r'\?\?', r'\?->', r'try\s*{', r'catch\s*\(', r'guard\b',
+        r'if\s*\(\s*\$?\w+\s*(?:!==?|===?)\s*null',
+        r'Optional\.', r'orElse\(',
+    ]
+    rem_bug = sum(1 for p in bug_fix_signals_rem if re.search(p, removed_text, re.I))
+    add_fix = sum(1 for p in bug_fix_signals_add if re.search(p, added_text, re.I))
+    if rem_bug >= 1 and add_fix >= 2:
+        return ("Corrección de bug: se añaden guardas de nulidad / manejo de excepciones "
+                "para evitar errores en tiempo de ejecución cuando un valor puede ser nulo o indefinido.")
+
+    # ── Patrón: refactor de legibilidad ────────────────────────────────────
+    if (removed_text.count('?') > 2 and
+            re.search(r'if\s*\(', added_text) and
+            not re.search(r'if\s*\(', removed_text)):
+        return ("Refactor de legibilidad: expresiones ternarias anidadas se reescriben "
+                "como bloques if/else explícitos para facilitar la comprensión y el mantenimiento.")
+
+    # ── Patrón: optimización de rendimiento ────────────────────────────────
+    perf_add = [r'\.cache\b', r'memoize', r'lazy', r'async\s+', r'await\s+',
+                r'Promise', r'->with\s*\(', r'eager', r'index\b', r'LIMIT\b']
+    perf_rem = [r'n\s*\+\s*1', r'foreach.*foreach', r'while.*query', r'SELECT \*']
+    if (sum(1 for p in perf_add if re.search(p, added_text, re.I)) >= 2 or
+            sum(1 for p in perf_rem if re.search(p, removed_text, re.I)) >= 1):
+        return ("Optimización de rendimiento: se introduce carga diferida, caché o "
+                "eager-loading para reducir la cantidad de consultas o procesamiento innecesario.")
+
+    # ── Patrón: nueva funcionalidad ────────────────────────────────────────
+    if not removed_text.strip() and added_text.strip():
+        fn_match = re.search(
+            r'(?:function|def|func|sub|procedure|public\s+\w+\s+\w+\s*\()\s+(\w+)',
+            added_text, re.I
+        )
+        if fn_match:
+            return f"Nueva funcionalidad: se implementa '{fn_match.group(1)}' como punto de entrada o lógica nueva."
+        return "Nueva funcionalidad: se agrega código sin precedente en el archivo (no hay líneas eliminadas equivalentes)."
+
+    # ── Patrón: eliminación de código muerto / limpieza ───────────────────
+    if not added_text.strip() and removed_text.strip():
+        if re.search(r'console\.|print\(|logger\.|MsgBox|Debug\.Print', removed_text, re.I):
+            return "Limpieza: se eliminan trazas de depuración que no deben llegar a producción."
+        return "Limpieza: se elimina código sin reemplazo (posiblemente obsoleto o sin uso detectado)."
+
+    # ── Patrón: cambio de contrato de API / interfaz ──────────────────────
+    if (re.search(r'return\s+', removed_text) and re.search(r'return\s+', added_text)):
+        ret_rem = re.findall(r'return\s+(.+?)(?:;|\n)', removed_text)
+        ret_add = re.findall(r'return\s+(.+?)(?:;|\n)', added_text)
+        if ret_rem and ret_add and ret_rem[0].strip() != ret_add[0].strip():
+            return ("Cambio de contrato: el valor de retorno de la función fue modificado, "
+                    "lo que puede afectar a los consumidores de esta API o método.")
+
+    # ── Patrón: cambio de lógica de negocio (condicional principal) ────────
+    cond_rem = len(re.findall(r'\bif\s*\(', removed_text))
+    cond_add = len(re.findall(r'\bif\s*\(', added_text))
+    if abs(cond_add - cond_rem) >= 2:
+        if cond_add > cond_rem:
+            return ("Cambio de lógica de negocio: se agregan condiciones que bifurcan el flujo "
+                    "para cubrir nuevos casos o escenarios de uso.")
+        else:
+            return ("Simplificación de lógica de negocio: se eliminan condiciones redundantes "
+                    "o se consolida el flujo en una rama única más directa.")
+
+    # ── Patrón: actualización de dependencia / importación ────────────────
+    import_rem = [l for l in removed if re.match(r'\s*(import|use|require|from|using)\b', l)]
+    import_add = [l for l in added   if re.match(r'\s*(import|use|require|from|using)\b', l)]
+    if import_rem and import_add and not (
+        set(l.strip() for l in import_rem) == set(l.strip() for l in import_add)
+    ):
+        return ("Actualización de dependencias: se cambian los módulos o clases importadas, "
+                "posiblemente para usar una versión actualizada o un reemplazo de la dependencia.")
+
+    # ── Patrón: seguridad / autenticación ─────────────────────────────────
+    sec_add = [r'auth\b', r'token\b', r'jwt\b', r'middleware', r'guard\b',
+               r'authorize', r'permission', r'role\b', r'sanitize', r'escape\b']
+    if sum(1 for p in sec_add if re.search(p, added_text, re.I)) >= 2:
+        return ("Mejora de seguridad: se refuerzan controles de autenticación, "
+                "autorización o sanitización de datos de entrada.")
+
+    # ── Patrón: internacionalización / localización ────────────────────────
+    if re.search(r'translate\.|i18n\.|locale\b|__\(', added_text, re.I):
+        return ("Internacionalización: se incorporan traducciones o literales internacionalizados "
+                "para soportar múltiples idiomas o regiones.")
+
+    # ── Patrón: corrección de estilo / linter ─────────────────────────────
+    r_ns = re.sub(r'\s+', '', removed_text)
+    a_ns = re.sub(r'\s+', '', added_text)
+    similarity = len(r_ns) > 0 and len(a_ns) > 0 and (
+        abs(len(r_ns) - len(a_ns)) / max(len(r_ns), len(a_ns)) < 0.15
+    )
+    if similarity and removed_text != added_text:
+        return ("Corrección de estilo/linter: los cambios son mínimos en contenido lógico "
+                "pero ajustan formato, espaciado, comillas o convenciones del equipo (ESLint/Prettier).")
+
+    return None
 
 
 # =============================================================================
@@ -653,27 +826,34 @@ def analyze_php_logic_changes(
     """
     Motor heurístico de análisis lógico para archivos PHP / Laravel.
 
-    Detecta múltiples escenarios:
-      1. Descomposición de ternarios en bloques if/else explícitos.
-      2. Refactor de acceso directo a relación → acceso con null-safe.
-      3. Introducción / eliminación de variables intermedias.
-      4. Cambio de lógica de determinación de campos (tienda, lugar, motivo…).
-      5. Adición / eliminación de guard de nulidad (?? / ?->).
-      6. Cambio en estructura de array de retorno / respuesta.
-      7. Extracción de lógica inline a bloque condicional separado.
-      8. Adición de comentarios descriptivos de sección.
-      9. Refactor de acceso a propiedad directa → método relacional.
-     10. Cambio de consulta Eloquent (scope, método, relaciones eager).
-     11. Adición / eliminación de validación de petición.
-     12. Cambio en respuesta HTTP (campos, estructura JSON).
-     13. Cambio en definición de función / firma de método.
-     14. Eliminación de acceso directo a propiedad sin guard (posible corrección de error).
-     15. Descomposición de expresión compleja en pasos intermedios.
+    Detecta múltiples escenarios e INFIERE EL PROPÓSITO de cada cambio:
+      1.  Descomposición de ternarios en bloques if/else explícitos.
+      2.  Refactor de acceso directo a relación → acceso con null-safe.
+      3.  Introducción / eliminación de variables intermedias.
+      4.  Cambio de lógica de determinación de campos (tienda, lugar, motivo…).
+      5.  Adición / eliminación de guard de nulidad (?? / ?->).
+      6.  Cambio en estructura de array de retorno / respuesta.
+      7.  Extracción de lógica inline a bloque condicional separado.
+      8.  Adición de comentarios descriptivos de sección.
+      9.  Refactor de acceso a propiedad directa → método relacional.
+     10.  Cambio de consulta Eloquent (scope, método, relaciones eager).
+     11.  Adición / eliminación de validación de petición.
+     12.  Cambio en respuesta HTTP (campos, estructura JSON).
+     13.  Cambio en definición de función / firma de método.
+     14.  Eliminación de acceso directo a propiedad sin guard.
+     15.  Descomposición de expresión compleja en pasos intermedios.
+     16+. OAuth2/Keycloak, JWT, Guzzle, duplicidades, claims.
+     NEW: Propósito general inferido al inicio de cada análisis.
     """
     insights: List[str] = []
 
     added_text   = "\n".join(added)
     removed_text = "\n".join(removed)
+
+    # ── Propósito general del cambio (inferencia de alto nivel) ─────────────
+    purpose = infer_modification_purpose(added, removed, ext='.php')
+    if purpose:
+        insights.append(f"🎯 Propósito del cambio: {purpose}")
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -1410,6 +1590,8 @@ class SemanticInsightEngine:
     Motor heurístico que intenta deducir la intención del cambio.
     No depende de ejemplos específicos.
     Detecta patrones arquitectónicos, de layout, estado y diseño.
+    Versión mejorada: incluye inferencia de PROPÓSITO del cambio y análisis
+    de patrones adicionales (TypeScript avanzado, SQL, Vue, React, etc.).
     """
 
     def analyze(self, fc: FileChange) -> List[str]:
@@ -1418,6 +1600,11 @@ class SemanticInsightEngine:
         added = "\n".join(fc.added)
         removed = "\n".join(fc.removed)
         full = added + "\n" + removed
+
+        # ── Propósito general del cambio ──────────────────────────────────
+        purpose = infer_modification_purpose(fc.added, fc.removed, fc.ext)
+        if purpose:
+            insights.append(f"🎯 Propósito del cambio: {purpose}")
 
         # ---------------------------------------------------------
         # 1. Migración de lógica TS hacia CSS
@@ -1650,6 +1837,168 @@ class SemanticInsightEngine:
                 "permitiendo que ciertos registros omitan restricciones de IP y balance. "
                 "Patrón equivalente a feature-flag a nivel de entidad."
             )
+
+        # ---------------------------------------------------------
+        # 17. TypeScript: migración de callback a async/await
+        # ---------------------------------------------------------
+        if fc.ext in ('.ts', '.component.ts', '.service.ts'):
+            callbacks_rem = len(re.findall(r'\.then\s*\(|\.catch\s*\(|new\s+Promise\s*\(', removed))
+            async_add     = len(re.findall(r'\bawait\b|\basync\b', added))
+            if callbacks_rem >= 2 and async_add >= 1:
+                insights.append(
+                    "Modernización asíncrona: se migran cadenas de Promises/callbacks (.then/.catch) "
+                    "al patrón async/await, mejorando legibilidad y manejo de errores."
+                )
+
+        # ---------------------------------------------------------
+        # 18. TypeScript: extracción de método (método largo → varios cortos)
+        # ---------------------------------------------------------
+        if fc.ext in ('.ts', '.component.ts', '.service.ts'):
+            fn_add = len(re.findall(r'(?:private|public|protected)?\s*\w+\s*\([^)]*\)\s*[:{]', added))
+            fn_rem = len(re.findall(r'(?:private|public|protected)?\s*\w+\s*\([^)]*\)\s*[:{]', removed))
+            if fn_add > fn_rem + 1:
+                insights.append(
+                    f"Extracción de métodos: se dividen responsabilidades en {fn_add - fn_rem} función(es) "
+                    "adicional(es), favoreciendo el principio de responsabilidad única (SRP)."
+                )
+
+        # ---------------------------------------------------------
+        # 19. Introducción de tipado fuerte (any → tipo concreto)
+        # ---------------------------------------------------------
+        if fc.ext in ('.ts', '.component.ts', '.service.ts', '.interface.ts'):
+            any_rem = len(re.findall(r':\s*any\b', removed))
+            any_add = len(re.findall(r':\s*any\b', added))
+            typed_add = len(re.findall(
+                r':\s*(?:string|number|boolean|Date|Observable|Promise|Array|Record|Map)\b', added
+            ))
+            if any_rem > any_add and typed_add > 0:
+                insights.append(
+                    f"Refuerzo de tipado: se reemplazan {any_rem - any_add} uso(s) de 'any' "
+                    "por tipos concretos, mejorando la detección de errores en tiempo de compilación."
+                )
+
+        # ---------------------------------------------------------
+        # 20. SQL: cambio de tipo de JOIN (seguridad / datos faltantes)
+        # ---------------------------------------------------------
+        if fc.ext in ('.sql', '.py', '.php', '.ts', '.js', '.cs', '.java'):
+            join_rem = re.findall(r'\b(INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN)\b',
+                                  removed, re.I)
+            join_add = re.findall(r'\b(INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN)\b',
+                                  added, re.I)
+            if join_rem and join_add:
+                j_rem_set = {j.upper().strip() for j in join_rem}
+                j_add_set = {j.upper().strip() for j in join_add}
+                if j_rem_set != j_add_set:
+                    from_j = ", ".join(sorted(j_rem_set))
+                    to_j   = ", ".join(sorted(j_add_set))
+                    insights.append(
+                        f"Cambio de JOIN en consulta SQL: de '{from_j}' a '{to_j}'. "
+                        "Esto puede afectar qué registros se incluyen cuando no hay datos relacionados."
+                    )
+
+        # ---------------------------------------------------------
+        # 21. React/Vue: gestión de efectos secundarios
+        # ---------------------------------------------------------
+        if fc.ext in ('.tsx', '.jsx', '.vue'):
+            use_effect_rem = len(re.findall(r'useEffect\s*\(', removed))
+            use_effect_add = len(re.findall(r'useEffect\s*\(', added))
+            watch_rem = len(re.findall(r'\bwatch\s*\(|\bwatchEffect\s*\(', removed))
+            watch_add = len(re.findall(r'\bwatch\s*\(|\bwatchEffect\s*\(', added))
+
+            if use_effect_add > use_effect_rem:
+                insights.append(
+                    f"Se agregan {use_effect_add - use_effect_rem} efecto(s) secundario(s) (useEffect) "
+                    "para sincronizar estado con dependencias externas o del DOM."
+                )
+            elif use_effect_rem > use_effect_add:
+                insights.append(
+                    f"Se eliminan {use_effect_rem - use_effect_add} efecto(s) secundario(s) (useEffect); "
+                    "posible simplificación del ciclo de vida del componente."
+                )
+            if watch_add > watch_rem:
+                insights.append(
+                    f"Se agregan {watch_add - watch_rem} watcher(s) Vue para reaccionar "
+                    "a cambios de estado reactivo."
+                )
+
+        # ---------------------------------------------------------
+        # 22. Detección de renombrado semántico de variable/método
+        # ---------------------------------------------------------
+        identifiers_rem = set(re.findall(r'\b([a-z][a-zA-Z0-9]{3,})\b', removed))
+        identifiers_add = set(re.findall(r'\b([a-z][a-zA-Z0-9]{3,})\b', added))
+        only_rem = identifiers_rem - identifiers_add - {'true','false','null','undefined','this','self'}
+        only_add = identifiers_add - identifiers_rem - {'true','false','null','undefined','this','self'}
+        # Filtrar: solo palabras que parecen identificadores de dominio (no palabras comunes)
+        stop = {'return','const','let','var','function','class','import','export',
+                'from','public','private','protected','static','async','await',
+                'interface','type','enum','string','number','boolean','void',
+                'that','with','have','this','your','from','they','their'}
+        only_rem -= stop
+        only_add -= stop
+        if 1 <= len(only_rem) <= 4 and 1 <= len(only_add) <= 4:
+            rem_list = sorted(only_rem)[:3]
+            add_list = sorted(only_add)[:3]
+            if rem_list and add_list:
+                insights.append(
+                    f"Posible renombrado semántico: identificador(es) '{', '.join(rem_list)}' "
+                    f"reemplazado(s) por '{', '.join(add_list)}', sugiriendo "
+                    "aclaración del nombre o cambio en el modelo de dominio."
+                )
+
+        # ---------------------------------------------------------
+        # 23. Introducción de manejo de errores donde no había
+        # ---------------------------------------------------------
+        has_try_add = bool(re.search(r'\btry\s*[{\(]|\bcatch\s*\(|\bexcept\b|\brescue\b', added, re.I))
+        has_try_rem = bool(re.search(r'\btry\s*[{\(]|\bcatch\s*\(|\bexcept\b|\brescue\b', removed, re.I))
+        if has_try_add and not has_try_rem:
+            insights.append(
+                "Se introduce manejo de excepciones (try/catch) donde antes el código era "
+                "susceptible a fallar silenciosamente; mejora la robustez ante errores inesperados."
+            )
+        elif has_try_rem and not has_try_add:
+            insights.append(
+                "Se elimina bloque try/catch previo; verificar que los errores posibles "
+                "queden manejados en una capa superior o que el flujo garantice no lanzar excepciones."
+            )
+
+        # ---------------------------------------------------------
+        # 24. Cambio de valor literal hardcodeado a variable/constante
+        # ---------------------------------------------------------
+        hardcoded_rem = re.findall(r'[\'"][A-Z0-9_]{4,}[\'"]|=\s*\d{2,}', removed)
+        hardcoded_add = re.findall(r'[\'"][A-Z0-9_]{4,}[\'"]|=\s*\d{2,}', added)
+        const_add     = bool(re.search(r'\b(const|final|readonly|CONSTANT|CONFIG)\b', added, re.I))
+        if len(hardcoded_rem) > len(hardcoded_add) and const_add:
+            insights.append(
+                "Se reemplazan valores hardcodeados por constantes o variables configurables, "
+                "centralizando la configuración y facilitando futuros cambios sin tocar la lógica."
+            )
+
+        # ---------------------------------------------------------
+        # 25. Eliminación de código comentado (deuda técnica)
+        # ---------------------------------------------------------
+        comment_rem_lines = [
+            l for l in fc.removed
+            if re.match(r'\s*(?://|#|\'|\*|<!--|/\*)', l.strip()) and len(l.strip()) > 5
+        ]
+        if len(comment_rem_lines) >= 3:
+            insights.append(
+                f"Se eliminan {len(comment_rem_lines)} línea(s) de código comentado (deuda técnica), "
+                "limpiando el historial del archivo y reduciendo confusión para futuros revisores."
+            )
+
+        # ---------------------------------------------------------
+        # 26. CSS: cambio de unidades absolutas a relativas (accesibilidad)
+        # ---------------------------------------------------------
+        if fc.ext in ('.css', '.scss', '.component.scss'):
+            px_rem = len(re.findall(r'\d+px', removed))
+            px_add = len(re.findall(r'\d+px', added))
+            rem_add_units = len(re.findall(r'\d+(?:rem|em|%|vh|vw)', added))
+            if px_rem > px_add and rem_add_units > 0:
+                insights.append(
+                    f"Mejora de accesibilidad: se reducen {px_rem - px_add} valor(es) en píxeles (px) "
+                    "reemplazados por unidades relativas (rem/em/%), respetando la configuración "
+                    "de fuente del navegador del usuario."
+                )
 
         return insights
 
@@ -3784,6 +4133,100 @@ class ReportGenerator:
                 else:
                     _bullet(self.doc, line_display, "-", C_DEL_TEXT)
 
+    # Extensiones que NO deben mostrar detalle de líneas incluso en resumen estructural
+    _SKIP_LINE_DETAIL_EXTS: frozenset = frozenset([
+        '.bak', '.sln', '.vbproj', '.csproj', '.vcxproj', '.fsproj',
+        '.resx', '.xml', '.config', '.manifest',
+    ])
+
+    def _render_line_detail_limited(self, fc: "FileChange", max_added: int = 80, max_removed: int = 80):
+        """
+        Renderizado de líneas con límite para archivos grandes que además tienen resumen
+        estructural. Garantiza que los nuevos métodos y cambios de lógica sean siempre
+        visibles en el informe aunque el archivo supere el umbral de líneas.
+        """
+        added_items   = fc.added_with_line   or [(None, l) for l in fc.added]
+        removed_items = fc.removed_with_line or [(None, l) for l in fc.removed]
+
+        # ── Líneas añadidas ───────────────────────────────────────────────────
+        if added_items:
+            n_total   = len(added_items)
+            truncated = n_total > max_added
+            label     = (
+                f"Lineas anadidas ({n_total} total"
+                f" — se muestran las primeras {max_added}):"
+                if truncated else "Lineas anadidas:"
+            )
+            p_add = self.doc.add_paragraph()
+            p_add.paragraph_format.space_before = Pt(6)
+            _run(p_add, label, bold=True, color=C_ADD_TEXT, size=9)
+
+            for line_no, line in added_items[:max_added]:
+                if line_no is not None:
+                    _bullet(self.doc, f"L{line_no}: {line}", "+", C_ADD_TEXT)
+                else:
+                    _bullet(self.doc, line, "+", C_ADD_TEXT)
+
+            if truncated:
+                _bullet(
+                    self.doc,
+                    f"... y {n_total - max_added} linea(s) adicional(es) no mostradas.",
+                    "…", C_MUTED,
+                )
+
+        # ── Líneas eliminadas ─────────────────────────────────────────────────
+        if removed_items:
+            n_total   = len(removed_items)
+            truncated = n_total > max_removed
+            label     = (
+                f"Lineas eliminadas ({n_total} total"
+                f" — se muestran las primeras {max_removed}):"
+                if truncated else "Lineas eliminadas:"
+            )
+            p_rem = self.doc.add_paragraph()
+            p_rem.paragraph_format.space_before = Pt(4)
+            _run(p_rem, label, bold=True, color=C_DEL_TEXT, size=9)
+
+            TAG_COLORS = {
+                "Linter":        C_ADD_TEXT,
+                "Limpieza":      C_MUTED,
+                "Debug":         C_MUTED,
+                "Doc":           C_MUTED,
+                "Deuda tecnica": C_REF_TEXT,
+                "Config":        C_MOD_TEXT,
+                "Refactor":      C_REF_TEXT,
+                "Test":          C_SUBTITLE,
+            }
+
+            for line_no, line in removed_items[:max_removed]:
+                reason       = fc.classify_removed_line(line)
+                line_display = f"L{line_no}: {line}" if line_no is not None else line
+                if reason:
+                    tag_match = re.match(r'\[([^\]]+)\]\s*(.*)', reason)
+                    if tag_match:
+                        tag_key  = tag_match.group(1)
+                        tag_desc = tag_match.group(2)
+                        tc_tag   = TAG_COLORS.get(tag_key, C_SUBTITLE)
+                        p_line   = self.doc.add_paragraph()
+                        p_line.paragraph_format.left_indent       = Cm(1.0)
+                        p_line.paragraph_format.first_line_indent = Cm(-0.5)
+                        p_line.paragraph_format.space_after       = Pt(2)
+                        _run(p_line, "-  ", bold=True, color=C_DEL_TEXT, size=9)
+                        _run(p_line, line_display, color=C_DEL_TEXT, size=9)
+                        _run(p_line, f"  [{tag_key}: {tag_desc}]",
+                             bold=True, color=tc_tag, size=8, italic=True)
+                    else:
+                        _bullet(self.doc, f"{line_display}  ({reason})", "-", C_DEL_TEXT)
+                else:
+                    _bullet(self.doc, line_display, "-", C_DEL_TEXT)
+
+            if truncated:
+                _bullet(
+                    self.doc,
+                    f"... y {n_total - max_removed} linea(s) adicional(es) no mostradas.",
+                    "…", C_MUTED,
+                )
+
     def _render_eslint_report(self, eslint_report: "ESLintFileReport", fc: "FileChange"):
         """
         Renderiza las tablas ESLint (correcciones, violaciones y cambios funcionales)
@@ -4023,6 +4466,11 @@ class ReportGenerator:
                 self._render_lockfile_detail(fc)
             elif fc.needs_structural_summary:
                 self._render_structural_summary(fc)
+                # FIX: Para archivos MODIFICADOS (no nuevos, no extensiones sólo-estructura),
+                # mostrar también las líneas cambiadas para que los nuevos métodos y cambios
+                # de lógica queden explícitos en el informe.
+                if fc.kind not in ('added',) and fc.ext not in self._SKIP_LINE_DETAIL_EXTS:
+                    self._render_line_detail_limited(fc)
             else:
                 self._render_line_detail(fc)
 
